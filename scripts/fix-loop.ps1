@@ -27,17 +27,7 @@ New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 # Build the video test instruction
 $videoInstruction = ""
 if ($TestVideo -ne "" -and (Test-Path $TestVideo)) {
-    $videoInstruction = @"
-
-CRITICAL: A real tennis test video is available at '$TestVideo'. You MUST:
-1. Start the API server (uvicorn src.api.main:app --port 8000) in the background
-2. Upload this video via POST /upload
-3. Wait for processing to complete via GET /status/{job_id}
-4. Check GET /results/{job_id} for meaningful output (ball detections > 0, court detected, etc.)
-5. If the frontend exists, try 'npm run build' in frontend/ and verify heatmap image URLs work
-6. Kill the API server when done
-Include the actual results numbers in your feedback (how many balls detected, court confidence, rallies found, etc.)
-"@
+    $videoInstruction = "CRITICAL: A real tennis test video is available at '$TestVideo'. You MUST: 1) Start the API server (uvicorn src.api.main:app --port 8000) in the background, 2) Upload this video via POST /upload, 3) Wait for processing to complete via GET /status/job_id, 4) Check GET /results/job_id for meaningful output (ball detections > 0, court detected, etc.), 5) If the frontend exists, try npm run build in frontend/ and verify heatmap image URLs work, 6) Kill the API server when done. Include the actual results numbers in your feedback (how many balls detected, court confidence, rallies found, etc.)."
     Ok "Test video: $TestVideo"
 } else {
     if ($TestVideo -ne "") { Warn "Test video not found: $TestVideo" }
@@ -49,29 +39,7 @@ Include the actual results numbers in your feedback (how many balls detected, co
 function Run-Evaluator($round) {
     Log "Round $round — Running Evaluator..."
 
-    $evalPrompt = @"
-You are the Evaluator agent for the Tennis Vision project. Read .github/agents/evaluator.agent.md, AGENTS.md, and state/checkpoint.md.
-
-Your job: find EVERY bug, broken feature, code quality issue, and missing piece. Be thorough and ruthless.
-
-Specifically check:
-- All Python tests pass (python -m pytest tests/ -v)
-- All imports work (python -c "from src.api.main import app")
-- API server starts and all endpoints respond correctly
-- Frontend builds (cd frontend && npm run build)
-- Frontend heatmap image URLs are correct (no double-prefixed paths)
-- Pipeline test mocks match actual code (iter_frames vs read_all)
-- Edge cases: empty video, corrupt file, missing weights
-- Code quality: unused imports, duplicated code, hardcoded values
-$videoInstruction
-
-Write your findings to state/feedback.md. Use this format:
-- ## Issues Found — numbered list, each with file path and line number
-- ## Fixed Since Last Round — what improved (if this is round 2+)
-- ## Verdict — either "CLEAN" (no issues worth fixing) or "NEEDS_FIX" (issues remain)
-
-The verdict line MUST be the last line and MUST be exactly: Verdict: CLEAN or Verdict: NEEDS_FIX
-"@
+    $evalPrompt = "You are the Evaluator agent for the Tennis Vision project. Read .github/agents/evaluator.agent.md, AGENTS.md, and state/checkpoint.md. Your job: find EVERY bug, broken feature, code quality issue, and missing piece. Be thorough and ruthless. Check: all Python tests pass (python -m pytest tests/ -v), all imports work, API server starts and all endpoints respond correctly, frontend builds (cd frontend && npm run build), frontend heatmap image URLs are correct (no double-prefixed paths), pipeline test mocks match actual code (iter_frames vs read_all), edge cases (empty video, corrupt file, missing weights), code quality (unused imports, duplicated code, hardcoded values). $videoInstruction Write your findings to state/feedback.md. Use this format: ## Issues Found (numbered list, each with file path and line number), ## Fixed Since Last Round (what improved if round 2+), ## Verdict (either CLEAN or NEEDS_FIX). The verdict line MUST be the last line and MUST be exactly: Verdict: CLEAN or Verdict: NEEDS_FIX"
 
     Push-Location $ProjectDir
     & $CopilotCmd -p $evalPrompt @EvaluatorFlags 2>&1 | Tee-Object -FilePath (Join-Path $LogDir "fix-round-${round}-evaluator.log")
@@ -96,23 +64,7 @@ The verdict line MUST be the last line and MUST be exactly: Verdict: CLEAN or Ve
 function Run-Fixer($round) {
     Log "Round $round — Running Generator (fix mode)..."
 
-    $fixPrompt = @"
-You are the Generator agent in FIX MODE. Read .github/agents/generator.agent.md, AGENTS.md, state/checkpoint.md, and state/feedback.md.
-
-Your ONLY job: fix EVERY issue listed in feedback.md. Do not add new features. Do not skip issues.
-
-For each issue:
-1. Read the relevant file
-2. Fix the bug
-3. Verify the fix works (run the test, import the module, etc.)
-
-After fixing everything:
-- Run the full test suite: python -m pytest tests/ -v
-- Verify API starts: python -c "from src.api.main import app; print('OK')"
-- Update state/checkpoint.md with what you fixed
-
-Be thorough. The evaluator will check your work again.
-"@
+    $fixPrompt = "You are the Generator agent in FIX MODE. Read .github/agents/generator.agent.md, AGENTS.md, state/checkpoint.md, and state/feedback.md. Your ONLY job: fix EVERY issue listed in feedback.md. Do not add new features. Do not skip issues. For each issue: read the relevant file, fix the bug, verify the fix works (run the test, import the module, etc.). After fixing everything: run the full test suite (python -m pytest tests/ -v), verify API starts (python -c 'from src.api.main import app; print(ok)'), update state/checkpoint.md with what you fixed. Be thorough. The evaluator will check your work again."
 
     Push-Location $ProjectDir
     & $CopilotCmd -p $fixPrompt @GeneratorFlags 2>&1 | Tee-Object -FilePath (Join-Path $LogDir "fix-round-${round}-generator.log")
