@@ -39,6 +39,29 @@ TrackNet's F1 drops from ~95% (broadcast) to potentially **below 50%** on amateu
 
 ---
 
+### Week 0: Data Labeling Pipeline (Pre-MVP Foundation)
+
+**Objective:** Build an automated multi-model labeling pipeline that produces near-complete ball position annotations for any courtside tennis video with minimal human review.
+
+| Task | Details |
+|------|---------|
+| Multi-model inference runner | Run TrackNet V2, TrackNet V4, Florence-2, and YOLO-World on every frame of an input video. Output per-frame ball coordinates (or "no detection") from each model. |
+| Consensus engine | For each frame, compare detections across models. **≥2 models agree** within 15px → auto-label as ground truth. **1 model only** → mark as "uncertain". **0 models** → mark as "no detection". |
+| CVAT-compatible export | Output annotations in CVAT XML or COCO JSON format. "Uncertain" frames flagged for human review. |
+| Review interface | Generate a video overlay showing: green dots (consensus), yellow dots (uncertain), red frames (no detection). Human reviews by scrubbing through the overlay video and correcting errors. |
+| Rally boundary auto-labeling | As a bonus signal: detect rally boundaries from ball activity density (clusters of detections = rally, gaps = dead time). Export as time ranges. |
+| CLI interface | `python -m src.labeling.pipeline <video_path> --output <annotations_dir>` |
+
+**Go/No-Go:**
+- ✅ Pipeline runs end-to-end on a test video without crashing
+- ✅ Consensus rate ≥60% of frames (≥2 models agree)
+- ✅ Output loads correctly in CVAT for human review
+- ❌ Consensus rate <30% → models are too divergent on courtside video. Fall back to single-model pre-labeling with full manual review.
+
+**Long-term value:** Every new match video you record feeds into this pipeline. Over time, accumulated labeled data enables fine-tuning. This is the data flywheel.
+
+---
+
 ## Phase 1: MVP (3 Weeks)
 
 **Goal:** Upload a 10-min match video → get auto-trimmed highlights with rally stats.
