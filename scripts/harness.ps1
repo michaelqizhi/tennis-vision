@@ -6,7 +6,7 @@ param(
     [int]$MaxSprints = 8
 )
 
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = "Continue"
 
 $ProjectDir = Split-Path -Parent $PSScriptRoot
 $StateDir = Join-Path $ProjectDir "state"
