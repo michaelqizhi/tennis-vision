@@ -46,8 +46,9 @@ function Run-Evaluator($round) {
     Push-Location $ProjectDir
     $logFile = Join-Path $LogDir "fix-round-${round}-evaluator.log"
     Log "Evaluator log: $logFile"
-    & $CopilotCmd -p $evalPrompt @EvaluatorFlags > $logFile 2>&1
-    Log "Evaluator exit code: $LASTEXITCODE"
+    $evalArgs = @($evalPrompt) + $EvaluatorFlags
+    $proc = Start-Process -FilePath $CopilotCmd -ArgumentList (@("-p") + $evalArgs) -NoNewWindow -Wait -RedirectStandardOutput $logFile -RedirectStandardError (Join-Path $LogDir "fix-round-${round}-evaluator-stderr.log") -PassThru
+    Log "Evaluator exit code: $($proc.ExitCode)"
     Pop-Location
 
     $feedbackFile = Join-Path $StateDir "feedback.md"
@@ -74,8 +75,9 @@ function Run-Fixer($round) {
     Push-Location $ProjectDir
     $logFile = Join-Path $LogDir "fix-round-${round}-generator.log"
     Log "Generator log: $logFile"
-    & $CopilotCmd -p $fixPrompt @GeneratorFlags > $logFile 2>&1
-    Log "Generator exit code: $LASTEXITCODE"
+    $fixArgs = @($fixPrompt) + $GeneratorFlags
+    $proc = Start-Process -FilePath $CopilotCmd -ArgumentList (@("-p") + $fixArgs) -NoNewWindow -Wait -RedirectStandardOutput $logFile -RedirectStandardError (Join-Path $LogDir "fix-round-${round}-generator-stderr.log") -PassThru
+    Log "Generator exit code: $($proc.ExitCode)"
     Pop-Location
 
     Ok "Generator fix round $round complete"
