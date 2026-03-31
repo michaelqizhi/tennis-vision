@@ -1,9 +1,10 @@
 # Tennis Vision — Harness Script (PowerShell)
-# Orchestrates: Planner → Generator → Evaluator loop
+# Orchestrates: Planner → Generator → Evaluator loop with fix cycles
 
 param(
     [int]$ResumeFrom = 0,
-    [int]$MaxSprints = 8
+    [int]$MaxSprints = 8,
+    [int]$MaxFixCycles = 2
 )
 
 $ErrorActionPreference = "Continue"
@@ -81,42 +82,95 @@ function Run-Planner {
 }
 
 # ============================================================
-# Generator + Evaluator Sprint
+# Check if feedback has critical issues
+# ============================================================
+function Has-CriticalIssues {
+    $feedbackFile = Join-Path $StateDir "feedback.md"
+    if (-not (Test-Path $feedbackFile)) { return $false }
+
+    $content = Get-Content $feedbackFile -Raw -ErrorAction SilentlyContinue
+    if ($content -match "(?i)what's broken" -and $content -match "(?i)critical") {
+        return $true
+    }
+    if ($content -match "(?i)## What's Broken" -and $content.Length -gt 500) {
+        # If there's a "What's Broken" section with substantial content
+        $brokenSection = ($content -split "(?i)## What's Broken")[1]
+        if ($brokenSection) {
+            $brokenSection = ($brokenSection -split "(?i)## ")[0]  # Get just that section
+            $lines = ($brokenSection -split "`n" | Where-Object { $_.Trim() -ne "" }).Count
+            if ($lines -ge 3) { return $true }
+        }
+    }
+    return $false
+}
+
+# ============================================================
+# Generator + Evaluator Sprint (with fix cycles)
 # ============================================================
 function Run-Sprint($sprint) {
     Log "========== Sprint $sprint =========="
 
-    # --- Generator ---
+    # --- Generator (implement new feature) ---
     Log "Running Generator (Sprint $sprint)..."
 
-    $genPrompt = "You are the Generator agent. Read .github/agents/generator.agent.md for your role, then AGENTS.md for conventions, then state/spec.md for the plan. This is Sprint $sprint. Read state/checkpoint.md and state/feedback.md if they exist. Implement Sprint ${sprint}'s deliverables and update state/checkpoint.md when done."
+    $genPrompt = "You are the Generator agent. Read .github/agents/generator.agent.md for your role, then AGENTS.md for conventions, then state/spec.md for the plan. This is Sprint $sprint. Read state/checkpoint.md and state/feedback.md if they exist. IMPORTANT: If feedback.md reports bugs or issues from the previous sprint, fix those FIRST before implementing new features. Update state/checkpoint.md when done."
 
     Push-Location $ProjectDir
     & $CopilotCmd -p $genPrompt @GeneratorFlags 2>&1 | Tee-Object -FilePath (Join-Path $LogDir "sprint-${sprint}-generator.log")
     Pop-Location
 
     $checkpointFile = Join-Path $StateDir "checkpoint.md"
-    if (Test-Path $checkpointFile) {
-        Ok "Generator Sprint $sprint complete"
-    } else {
+    if (-not (Test-Path $checkpointFile)) {
         Err "Generator did not update checkpoint.md"
         return $false
     }
+    Ok "Generator Sprint $sprint complete"
 
     # --- Evaluator ---
     Log "Running Evaluator (Sprint $sprint)..."
 
-    $evalPrompt = "You are the Evaluator agent. Read .github/agents/evaluator.agent.md for your role. Then read AGENTS.md and state/checkpoint.md. DO NOT read state/spec.md. Evaluate the current state of the project - try to run the code, test features, check quality. Write your findings to state/feedback.md."
+    $evalPrompt = "You are the Evaluator agent. Read .github/agents/evaluator.agent.md for your role. Then read AGENTS.md and state/checkpoint.md. DO NOT read state/spec.md. Evaluate the current state of the project - try to run the code, test features, check quality. Write your findings to state/feedback.md. Mark critical issues clearly with '### Critical' heading."
 
     Push-Location $ProjectDir
     & $CopilotCmd -p $evalPrompt @EvaluatorFlags 2>&1 | Tee-Object -FilePath (Join-Path $LogDir "sprint-${sprint}-evaluator.log")
     Pop-Location
 
-    $feedbackFile = Join-Path $StateDir "feedback.md"
-    if (Test-Path $feedbackFile) {
-        Ok "Evaluator Sprint $sprint complete"
-    } else {
+    if (-not (Test-Path (Join-Path $StateDir "feedback.md"))) {
         Warn "Evaluator did not write feedback.md - continuing anyway"
+        Log "Sprint $sprint done"
+        return $true
+    }
+    Ok "Evaluator Sprint $sprint complete"
+
+    # --- Fix cycles: if critical issues, send back to Generator ---
+    for ($fix = 1; $fix -le $MaxFixCycles; $fix++) {
+        if (-not (Has-CriticalIssues)) {
+            Log "No critical issues found - moving to next sprint"
+            break
+        }
+
+        Log "Critical issues detected - Fix cycle $fix/$MaxFixCycles"
+
+        $fixPrompt = "You are the Generator agent in FIX MODE. Read .github/agents/generator.agent.md, AGENTS.md, state/checkpoint.md, and state/feedback.md. Your ONLY job this session is to fix the issues reported in feedback.md — especially anything marked Critical. Do NOT add new features. Update state/checkpoint.md when done."
+
+        Push-Location $ProjectDir
+        & $CopilotCmd -p $fixPrompt @GeneratorFlags 2>&1 | Tee-Object -FilePath (Join-Path $LogDir "sprint-${sprint}-fix${fix}-generator.log")
+        Pop-Location
+
+        Ok "Fix cycle $fix Generator complete"
+
+        # Re-evaluate
+        Log "Re-evaluating after fix cycle $fix..."
+
+        Push-Location $ProjectDir
+        & $CopilotCmd -p $evalPrompt @EvaluatorFlags 2>&1 | Tee-Object -FilePath (Join-Path $LogDir "sprint-${sprint}-fix${fix}-evaluator.log")
+        Pop-Location
+
+        Ok "Fix cycle $fix Evaluator complete"
+    }
+
+    if (Has-CriticalIssues) {
+        Warn "Critical issues remain after $MaxFixCycles fix cycles - continuing anyway"
     }
 
     Log "Sprint $sprint done"
@@ -129,6 +183,7 @@ function Run-Sprint($sprint) {
 Write-Host ""
 Write-Host "============================================"
 Write-Host "  Tennis Vision - Automated Build Harness"
+Write-Host "  (with fix cycles, max $MaxFixCycles per sprint)"
 Write-Host "============================================"
 Write-Host ""
 
