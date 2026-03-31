@@ -137,7 +137,7 @@ for ($round = 1; $round -le $MaxRounds; $round++) {
     $verdict = Run-Evaluator $round
 
     if ($verdict -eq "CLEAN") {
-        Ok "Round $round: Evaluator says CLEAN — all issues resolved!"
+        Ok "Round $round - Evaluator says CLEAN - all issues resolved!"
         break
     }
 
