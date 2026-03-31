@@ -1,0 +1,8 @@
+# Additional dependencies for the multi-model labeling pipeline.
+# Install on top of the base requirements.txt:
+#   pip install -r requirements-labeling.txt
+
+transformers>=4.40.0
+ultralytics>=8.1.0
+supervision>=0.19.0
+Pillow>=10.0.0
