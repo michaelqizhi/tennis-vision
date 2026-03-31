@@ -3,7 +3,9 @@
 
 param(
     [int]$MaxRounds = 5,
-    [string]$TestVideo = ""  # Optional: path to a real tennis video for integration testing
+    [string]$TestVideo = "",  # Optional: path to a real tennis video for integration testing
+    [int]$StartRound = 1,     # Resume from this round number
+    [string]$StartPhase = "evaluator"  # Resume from "evaluator" or "generator"
 )
 
 $ErrorActionPreference = "Continue"
@@ -86,23 +88,33 @@ Write-Host ""
 Write-Host "============================================"
 Write-Host "  Tennis Vision — Fix Loop"
 Write-Host "  Max rounds: $MaxRounds"
+if ($StartRound -gt 1 -or $StartPhase -ne "evaluator") {
+    Write-Host "  Resuming: round $StartRound, phase $StartPhase"
+}
 Write-Host "============================================"
 Write-Host ""
 
-for ($round = 1; $round -le $MaxRounds; $round++) {
+for ($round = $StartRound; $round -le $MaxRounds; $round++) {
     Log "==================== Round $round / $MaxRounds ===================="
 
-    $verdict = Run-Evaluator $round
+    # Skip evaluator if resuming into generator phase
+    $skipEval = ($round -eq $StartRound -and $StartPhase -eq "generator")
 
-    if ($verdict -eq "CLEAN") {
-        Ok "Round $round - Evaluator says CLEAN - all issues resolved!"
-        break
-    }
+    if (-not $skipEval) {
+        $verdict = Run-Evaluator $round
 
-    if ($round -eq $MaxRounds) {
-        Warn "Reached max rounds ($MaxRounds). Some issues may remain."
-        Warn "Check state/feedback.md for remaining issues."
-        break
+        if ($verdict -eq "CLEAN") {
+            Ok "Round $round - Evaluator says CLEAN - all issues resolved!"
+            break
+        }
+
+        if ($round -eq $MaxRounds) {
+            Warn "Reached max rounds ($MaxRounds). Some issues may remain."
+            Warn "Check state/feedback.md for remaining issues."
+            break
+        }
+    } else {
+        Log "Skipping evaluator (resuming at generator phase)"
     }
 
     Run-Fixer $round
