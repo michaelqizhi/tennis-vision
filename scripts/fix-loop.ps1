@@ -42,10 +42,17 @@ function Run-Evaluator($round) {
     $evalPrompt = "You are the Evaluator agent for the Tennis Vision project. Read .github/agents/evaluator.agent.md, AGENTS.md, and state/checkpoint.md. Your job: find EVERY bug, broken feature, code quality issue, and missing piece. Be thorough and ruthless. Check: all Python tests pass (python -m pytest tests/ -v), all imports work, API server starts and all endpoints respond correctly, frontend builds (cd frontend && npm run build), frontend heatmap image URLs are correct (no double-prefixed paths), pipeline test mocks match actual code (iter_frames vs read_all), edge cases (empty video, corrupt file, missing weights), code quality (unused imports, duplicated code, hardcoded values). $videoInstruction Write your findings to state/feedback.md. Use this format: ## Issues Found (numbered list, each with file path and line number), ## Fixed Since Last Round (what improved if round 2+), ## Verdict (either CLEAN or NEEDS_FIX). The verdict line MUST be the last line and MUST be exactly: Verdict: CLEAN or Verdict: NEEDS_FIX"
 
     Push-Location $ProjectDir
+    $logFile = Join-Path $LogDir "fix-round-${round}-evaluator.log"
     try {
-        & $CopilotCmd -p $evalPrompt @EvaluatorFlags 2>&1 | Tee-Object -FilePath (Join-Path $LogDir "fix-round-${round}-evaluator.log")
+        & $CopilotCmd -p $evalPrompt @EvaluatorFlags *>&1 | ForEach-Object {
+            if ($_ -is [System.Management.Automation.ErrorRecord]) {
+                $_.ToString() | Tee-Object -FilePath $logFile -Append
+            } else {
+                $_ | Tee-Object -FilePath $logFile -Append
+            }
+        }
     } catch {
-        Warn "Evaluator process exited with error (likely stderr noise): $_"
+        Warn "Evaluator process exception: $_"
     }
     Pop-Location
 
@@ -71,10 +78,17 @@ function Run-Fixer($round) {
     $fixPrompt = "You are the Generator agent in FIX MODE. Read .github/agents/generator.agent.md, AGENTS.md, state/checkpoint.md, and state/feedback.md. Your ONLY job: fix EVERY issue listed in feedback.md. Do not add new features. Do not skip issues. For each issue: read the relevant file, fix the bug, verify the fix works (run the test, import the module, etc.). After fixing everything: run the full test suite (python -m pytest tests/ -v), verify API starts (python -c 'from src.api.main import app; print(ok)'), update state/checkpoint.md with what you fixed. Be thorough. The evaluator will check your work again."
 
     Push-Location $ProjectDir
+    $logFile = Join-Path $LogDir "fix-round-${round}-generator.log"
     try {
-        & $CopilotCmd -p $fixPrompt @GeneratorFlags 2>&1 | Tee-Object -FilePath (Join-Path $LogDir "fix-round-${round}-generator.log")
+        & $CopilotCmd -p $fixPrompt @GeneratorFlags *>&1 | ForEach-Object {
+            if ($_ -is [System.Management.Automation.ErrorRecord]) {
+                $_.ToString() | Tee-Object -FilePath $logFile -Append
+            } else {
+                $_ | Tee-Object -FilePath $logFile -Append
+            }
+        }
     } catch {
-        Warn "Generator process exited with error (likely stderr noise): $_"
+        Warn "Generator process exception: $_"
     }
     Pop-Location
 
