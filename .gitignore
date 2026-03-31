@@ -38,3 +38,6 @@ frontend/.next/
 
 # Uploads
 uploads/
+
+# Build artifacts
+*.egg-info/
