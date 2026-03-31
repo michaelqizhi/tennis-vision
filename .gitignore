@@ -1,0 +1,40 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Weights (downloaded, not committed)
+weights/
+
+# Output files
+output/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test videos
+*.mp4
+*.avi
+*.mov
+!tests/fixtures/
+
+# Logs
+logs/*.log
+
+# Node / Next.js
+node_modules/
+frontend/node_modules/
+frontend/.next/
+
+# Uploads
+uploads/
