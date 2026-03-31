@@ -52,17 +52,20 @@ TrackNet's F1 drops from ~95% (broadcast) to potentially **below 50%** on amateu
 | Push all missing code | Get all ~12-15 modules from Windows → GitHub |
 | Add `requirements.txt` / `pyproject.toml` | Nobody can install or run the project without this |
 | Add `config.yaml` | Wire up the config system that every module imports |
-| Swap to TrackNet V4 | Replace V2 with [AnInsomniacy/tracknet-series-pytorch](https://github.com/AnInsomniacy/tracknet-series-pytorch) (pretrained `.pth` weights included). V4 adds motion attention maps, designed for harder conditions. Free upgrade. |
-| Video stabilization | Add OpenCV VidStab pass before tracking. Phone video shakes; TrackNet assumes static camera. |
-| Ground truth annotation | Manually annotate **~200 frames** for ball position + **5-10 rally boundaries** on 1 test clip (2-3 min). Use [CVAT](https://github.com/cvat-ai/cvat) or [Label Studio](https://github.com/HumanSignal/label-studio). |
+| **Fix HoughCircles → weighted centroid** | Replace `postprocess()` HoughCircles with `cv2.moments` / `scipy.ndimage.center_of_mass`. Current code silently drops frames where HoughCircles finds 0 or 2+ circles — on oblique courtside video the ball heatmap is often elliptical, not circular. This is likely the single biggest detection rate improvement. ~10 lines of code. |
+| Multi-model benchmark | **Don't blindly pick one model.** Set up a comparison harness for: TrackNet V2 (current), TrackNet V4 ([AnInsomniacy/tracknet-series-pytorch](https://github.com/AnInsomniacy/tracknet-series-pytorch)), [Florence-2](https://huggingface.co/microsoft/Florence-2-large) (zero-shot, prompt "tennis ball"), [YOLO-World](https://github.com/AILab-CVC/YOLO-World) (zero-shot). Run all four on the same test clip, compare detection rate / FP rate / spatial error. Let data decide which model to use. |
+| Add YOLOv8-nano player detection | Off-the-shelf person detector (~100+ fps). Use player bounding boxes as a prior: reject ball detections far from both players. Zero training required. Free signal. |
+| Video stabilization | Test with and without OpenCV VidStab. May help (shaky video) or hurt (interpolation artifacts on small targets). Keep whichever scores better on the metrics harness. |
+| Ground truth annotation | Annotate **3 minutes** (~5400 frames) for ball position + **10-15 rally boundaries** on 1 test clip. Use [CVAT](https://github.com/cvat-ai/cvat) video interpolation mode (annotate every 5th frame, let CVAT interpolate between). ~3-4 hours. For scaling beyond MVP, use **multi-model ensemble pre-labeling**: run all 4 models, auto-accept frames where ≥2 models agree, only manually review disagreements (~10% of frames). |
 | Scoring harness | Build automated metrics: per-frame detection rate, false positive rate, spatial error (px), rally boundary IoU. |
-| Baseline measurement | Run TrackNet V4 on raw test video, record all metrics. This is the number to beat. |
+| Baseline measurement | Run all models on test video, record metrics per model. Pick the best performer for Week 2. |
 
 **Go/No-Go:**
 - ✅ Pipeline runs end-to-end without crashing
-- ✅ TrackNet V4 detects ball in **≥10% of frames**
+- ✅ Best model detects ball in **≥10% of frames** (across V2/V4/Florence-2/YOLO-World benchmark)
 - ✅ Scoring harness outputs metrics automatically
-- ❌ <10% detection rate → test video may be unusable (wrong angle/resolution). Record a new one from a slightly elevated position (e.g., on a bench or tripod at ~5ft height).
+- ✅ HoughCircles replaced with weighted centroid
+- ❌ <10% detection rate on ALL models → test video may be unusable (wrong angle/resolution). Record a new one from a slightly elevated position (e.g., on a bench or tripod at ~5ft height).
 
 ### Week 2: Court Detection + Ball Tracking Improvements
 
@@ -159,6 +162,10 @@ Trigger: Phase 1 metrics don't meet go/no-go criteria.
 
 | Component | Resource | URL |
 |-----------|----------|-----|
+| Zero-shot detection | Florence-2 | <https://huggingface.co/microsoft/Florence-2-large> |
+| Zero-shot detection | YOLO-World | <https://github.com/AILab-CVC/YOLO-World> |
+| Point tracking | CoTracker (Meta) | <https://github.com/facebookresearch/co-tracker> |
+| Player detection | YOLOv8-nano (ultralytics) | <https://github.com/ultralytics/ultralytics> |
 | Ball tracking (V4) | tracknet-series-pytorch | <https://github.com/AnInsomniacy/tracknet-series-pytorch> |
 | Ball tracking (V3 fine-tuned) | TracknetV3-tennis | <https://github.com/soumvincent/TracknetV3-tennis> |
 | Court detection | TennisCourtDetector | <https://github.com/yastrebksv/TennisCourtDetector> |
