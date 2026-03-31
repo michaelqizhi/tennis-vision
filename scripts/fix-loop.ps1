@@ -43,17 +43,9 @@ function Run-Evaluator($round) {
 
     Push-Location $ProjectDir
     $logFile = Join-Path $LogDir "fix-round-${round}-evaluator.log"
-    try {
-        & $CopilotCmd -p $evalPrompt @EvaluatorFlags *>&1 | ForEach-Object {
-            if ($_ -is [System.Management.Automation.ErrorRecord]) {
-                $_.ToString() | Tee-Object -FilePath $logFile -Append
-            } else {
-                $_ | Tee-Object -FilePath $logFile -Append
-            }
-        }
-    } catch {
-        Warn "Evaluator process exception: $_"
-    }
+    Log "Evaluator log: $logFile"
+    & $CopilotCmd -p $evalPrompt @EvaluatorFlags > $logFile 2>&1
+    Log "Evaluator exit code: $LASTEXITCODE"
     Pop-Location
 
     $feedbackFile = Join-Path $StateDir "feedback.md"
@@ -79,17 +71,9 @@ function Run-Fixer($round) {
 
     Push-Location $ProjectDir
     $logFile = Join-Path $LogDir "fix-round-${round}-generator.log"
-    try {
-        & $CopilotCmd -p $fixPrompt @GeneratorFlags *>&1 | ForEach-Object {
-            if ($_ -is [System.Management.Automation.ErrorRecord]) {
-                $_.ToString() | Tee-Object -FilePath $logFile -Append
-            } else {
-                $_ | Tee-Object -FilePath $logFile -Append
-            }
-        }
-    } catch {
-        Warn "Generator process exception: $_"
-    }
+    Log "Generator log: $logFile"
+    & $CopilotCmd -p $fixPrompt @GeneratorFlags > $logFile 2>&1
+    Log "Generator exit code: $LASTEXITCODE"
     Pop-Location
 
     Ok "Generator fix round $round complete"
