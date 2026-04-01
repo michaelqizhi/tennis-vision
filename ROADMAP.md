@@ -1,7 +1,7 @@
 # Tennis Vision — Technical Roadmap
 
 > SwingVision competitor for amateur recreational tennis players.
-> Single source of truth for project direction. Last updated: 2026-03-31.
+> Single source of truth for project direction. Last updated: 2026-04-01.
 
 ## Current State
 
@@ -37,6 +37,44 @@ TrackNet's F1 drops from ~95% (broadcast) to potentially **below 50%** on amateu
 
 **Correct approach:** Detect ball on **raw frames** (maximum image quality), then use court homography to **project coordinates** to court space for heatmaps/stats. This is the standard in every published tennis CV pipeline.
 
+## Primary Model Decision: TrackNet V5
+
+**TrackNet V5 is the default primary model.** This is not a multi-model shootout — V5 is the clear successor in the TrackNet lineage:
+
+- **V2 → V4 → V5** is a clean progression. V4 introduced motion attention maps (frame differencing) to handle occlusion/low-visibility, but used absolute difference which **loses direction information** (ball moving left vs right looks identical).
+- **V5 fixes this** with direction-decoupled motion channels + lightweight Transformer spatiotemporal refinement.
+- **Performance:** F1 = 0.9859 on TrackNet V2 benchmark dataset, FLOPs only +3.7% vs V4, 114 FPS on T4 GPU (real-time capable).
+- **No realistic scenario where V2 or V4 beats V5** on the same data.
+
+Other models (Florence-2, YOLO-World) serve as **pseudo-labeling contributors** in the consensus engine, not as primary model candidates.
+
+## Recording Specification (Input Quality Gate)
+
+> **The cheapest way to improve model accuracy is to constrain the input.**
+
+SwingVision requires specific recording conditions even for imported videos. We adopt similar constraints as hard requirements — videos that don't meet these are rejected at pipeline entry with guidance to re-record.
+
+### Hard Requirements
+
+| Constraint | Value | Rationale |
+|-----------|-------|-----------|
+| Resolution | ≥ 1080p | Ball is 3-5px at far court on 1080p; lower resolution makes it undetectable |
+| Frame rate | ≥ 60 fps | Ball moves 10-30px/frame at 60fps; at 30fps motion blur doubles and inter-frame gap is too large for temporal models |
+| Camera position | Behind baseline, centered | Side-on views cause extreme foreshortening; behind-baseline maximizes court visibility |
+| Camera height | ≥ 5 ft (tripod/bench/fence mount) | Ground-level causes extreme oblique angles; elevated position shows more court surface |
+| Court coverage | Both baselines visible in frame | Required for court detection and homography computation |
+| Stability | Tripod or fixed mount strongly preferred | Camera shake corrupts motion attention features in V4/V5 and degrades TrackNet temporal input |
+
+### Auto Quality Check (pipeline entry)
+
+The pipeline automatically validates:
+- Resolution and frame rate from video metadata
+- Court coverage via court keypoint detection (≥4 keypoints visible)
+- Stability score via frame-to-frame motion estimation
+
+Videos failing hard requirements → rejected with specific guidance ("mount higher", "move behind baseline", etc.).
+Videos failing soft requirements (stability) → warning + optional stabilization pass.
+
 ---
 
 ### Week 0: Data Labeling Pipeline (Pre-MVP Foundation)
@@ -45,8 +83,8 @@ TrackNet's F1 drops from ~95% (broadcast) to potentially **below 50%** on amateu
 
 | Task | Details |
 |------|---------|
-| Multi-model inference runner | Run TrackNet V2, TrackNet V4, Florence-2, and YOLO-World on every frame of an input video. Output per-frame ball coordinates (or "no detection") from each model. |
-| Consensus engine | For each frame, compare detections across models. **≥2 models agree** within 15px → auto-label as ground truth. **1 model only** → mark as "uncertain". **0 models** → mark as "no detection". |
+| Multi-model inference runner | Run TrackNet V5 (primary), Florence-2, and YOLO-World on every frame of an input video. Output per-frame ball coordinates (or "no detection") from each model. |
+| Consensus engine | For each frame, compare detections across models. Apply **three-layer validation** before accepting: (1) **Pixel agreement:** ≥2 models agree within 15px. (2) **Motion consistency:** predicted velocity/acceleration within physically plausible range given frame rate (reject teleporting detections). (3) **Appearance consistency:** local patch around candidate matches ball color/texture profile (reject white shoes, net tape reflections, line markings). Auto-accept frames passing all three → ground truth. Fail any layer → "uncertain" for human review. |
 | CVAT-compatible export | Output annotations in CVAT XML or COCO JSON format. "Uncertain" frames flagged for human review. |
 | Review interface | Generate a video overlay showing: green dots (consensus), yellow dots (uncertain), red frames (no detection). Human reviews by scrubbing through the overlay video and correcting errors. |
 | Rally boundary auto-labeling | As a bonus signal: detect rally boundaries from ball activity density (clusters of detections = rally, gaps = dead time). Export as time ranges. |
@@ -54,9 +92,9 @@ TrackNet's F1 drops from ~95% (broadcast) to potentially **below 50%** on amateu
 
 **Go/No-Go:**
 - ✅ Pipeline runs end-to-end on a test video without crashing
-- ✅ Consensus rate ≥60% of frames (≥2 models agree)
+- ✅ Consensus rate ≥60% of frames (≥2 models agree + pass validation)
 - ✅ Output loads correctly in CVAT for human review
-- ❌ Consensus rate <30% → models are too divergent on courtside video. Fall back to single-model pre-labeling with full manual review.
+- ❌ Consensus rate <30% → models are too divergent on courtside video. Fall back to single-model (V5) pre-labeling with full manual review.
 
 **Long-term value:** Every new match video you record feeds into this pipeline. Over time, accumulated labeled data enables fine-tuning. This is the data flywheel.
 
@@ -66,9 +104,28 @@ TrackNet's F1 drops from ~95% (broadcast) to potentially **below 50%** on amateu
 
 **Goal:** Upload a 10-min match video → get auto-trimmed highlights with rally stats.
 
-### Week 1: Foundation + Metrics
+### Evaluation Framework (applies to all weeks)
 
-**Objective:** Pipeline runs end-to-end on real video with measurable baseline.
+Metrics are organized in **three layers** — improvements must be measured at all three levels, because "better frame-level F1" can sometimes hurt trajectory continuity or rally segmentation.
+
+**Layer 1: Frame-level localization** (is the ball found correctly?)
+- Precision / Recall / F1 at adaptive distance threshold τ (scaled by ball size in frame, not fixed 15px)
+- Mean localization error (px) and P50/P90 error percentiles
+
+**Layer 2: Trajectory continuity** (is the track stable enough for downstream?)
+- Trajectory break rate: breaks per minute, maximum break duration
+- Physical consistency: % of frames with velocity/acceleration outliers
+
+**Layer 3: Event-level** (does the MVP output make sense?)
+- Rally segmentation IoU
+- Rally recall (% of real rallies detected) and false positive rate
+- Human evaluation: "shareable vs not shareable" on trimmed highlights
+
+**Golden test set:** 3-5 short video clips (2-3 min each), diverse courts/lighting/backgrounds, fully human-annotated for ball position + rally boundaries. All experiments report metrics on this set. Integrated into CI for regression testing.
+
+### Week 1: Foundation + V5 Baseline
+
+**Objective:** Pipeline runs end-to-end on real video with measurable V5 baseline.
 
 | Task | Details |
 |------|---------|
@@ -76,38 +133,42 @@ TrackNet's F1 drops from ~95% (broadcast) to potentially **below 50%** on amateu
 | Add `requirements.txt` / `pyproject.toml` | Nobody can install or run the project without this |
 | Add `config.yaml` | Wire up the config system that every module imports |
 | **Fix HoughCircles → weighted centroid** | Replace `postprocess()` HoughCircles with `cv2.moments` / `scipy.ndimage.center_of_mass`. Current code silently drops frames where HoughCircles finds 0 or 2+ circles — on oblique courtside video the ball heatmap is often elliptical, not circular. This is likely the single biggest detection rate improvement. ~10 lines of code. |
-| Multi-model benchmark | **Don't blindly pick one model.** Set up a comparison harness for: TrackNet V2 (current), TrackNet V4 ([AnInsomniacy/tracknet-series-pytorch](https://github.com/AnInsomniacy/tracknet-series-pytorch)), [Florence-2](https://huggingface.co/microsoft/Florence-2-large) (zero-shot, prompt "tennis ball"), [YOLO-World](https://github.com/AILab-CVC/YOLO-World) (zero-shot). Run all four on the same test clip, compare detection rate / FP rate / spatial error. Let data decide which model to use. |
+| **Integrate TrackNet V5** | V5 is the primary model. Set up inference pipeline, verify it runs on RTX 2060. Also run V2 (current) as baseline comparison to quantify improvement. |
+| Auxiliary model runs | Run Florence-2 and YOLO-World on the same test clips — **not as primary model candidates**, but to (a) characterize their detection patterns for pseudo-labeling consensus, and (b) identify V5's specific failure modes by comparing where they disagree. |
 | Add YOLOv8-nano player detection | Off-the-shelf person detector (~100+ fps). Use player bounding boxes as a prior: reject ball detections far from both players. Zero training required. Free signal. |
-| Video stabilization | Test with and without OpenCV VidStab. May help (shaky video) or hurt (interpolation artifacts on small targets). Keep whichever scores better on the metrics harness. |
-| Ground truth annotation | Annotate **3 minutes** (~5400 frames) for ball position + **10-15 rally boundaries** on 1 test clip. Use [CVAT](https://github.com/cvat-ai/cvat) video interpolation mode (annotate every 5th frame, let CVAT interpolate between). ~3-4 hours. For scaling beyond MVP, use **multi-model ensemble pre-labeling**: run all 4 models, auto-accept frames where ≥2 models agree, only manually review disagreements (~10% of frames). |
-| Scoring harness | Build automated metrics: per-frame detection rate, false positive rate, spatial error (px), rally boundary IoU. |
-| Baseline measurement | Run all models on test video, record metrics per model. Pick the best performer for Week 2. |
+| Video stabilization | Test with and without OpenCV VidStab. May help (shaky video) or hurt (interpolation artifacts on small targets, corruption of V5 motion features). Keep whichever scores better on the metrics harness. |
+| Ground truth annotation | Annotate **3 minutes** (~5400 frames at 30fps, ~10800 at 60fps) for ball position + visibility attribute (`visible` / `hard_to_see` / `occluded`) + **10-15 rally boundaries** on 1 test clip. Use [CVAT](https://github.com/cvat-ai/cvat) video interpolation mode (annotate every 5th frame, let CVAT interpolate between). ~3-4 hours. Label only in-play balls (during rallies/serves), not dead balls between points. |
+| Scoring harness | Build automated three-layer metrics (frame-level, trajectory, event-level). |
+| V5 baseline measurement | Run V5 on test video, record all three metric layers. Compare against V2 to quantify the upgrade. |
 
 **Go/No-Go:**
 - ✅ Pipeline runs end-to-end without crashing
-- ✅ Best model detects ball in **≥10% of frames** (across V2/V4/Florence-2/YOLO-World benchmark)
-- ✅ Scoring harness outputs metrics automatically
+- ✅ V5 detects ball in **≥30% of frames** on compliant video (recording spec met)
+- ✅ Three-layer scoring harness outputs metrics automatically
 - ✅ HoughCircles replaced with weighted centroid
-- ❌ <10% detection rate on ALL models → test video may be unusable (wrong angle/resolution). Record a new one from a slightly elevated position (e.g., on a bench or tripod at ~5ft height).
+- ❌ <30% detection rate → check recording compliance first. If compliant, domain gap is too severe for pretrained V5 — trigger Phase 2A fine-tuning early.
+- ❌ <10% detection rate on non-compliant video → expected. Re-record with proper setup before proceeding.
 
-### Week 2: Court Detection + Ball Tracking Improvements
+### Week 2: Court Detection + Trajectory Layer
 
-**Objective:** Significantly improve ball detection accuracy via filtering and multi-scale detection.
+**Objective:** Significantly improve tracking quality via court geometry and trajectory-level processing.
 
 | Task | Details |
 |------|---------|
 | Court detection | Integrate [TennisCourtDetector](https://github.com/yastrebksv/TennisCourtDetector) (14 keypoints, 96.1% on broadcast). Test on courtside footage — expect 4-6 keypoints visible. Also review [arxiv:2404.06977](https://arxiv.org/abs/2404.06977) for amateur-specific court detection. |
-| Homography computation | Compute perspective transform from detected court keypoints. Use for coordinate projection (detect-then-project). |
-| Court-boundary filtering | Reject any ball detection whose pixel coordinates project outside the court polygon. Major false positive reduction. |
-| Far-court crop detection | Run TrackNet a **second time** on a 2x-zoomed crop of the far court region (where ball is tiny). Merge detections from full-frame + crop passes. This directly addresses the "ball too small at far end" problem. |
-| Measure improvement | Re-run scoring harness. Compare detection rate, FP rate, spatial error against Week 1 baseline. |
+| Homography computation | Compute perspective transform from detected court keypoints. **Use keyframe-based updates + temporal smoothing** — do NOT estimate homography independently per frame (jitter from frame-to-frame keypoint noise gets amplified into coordinate space). |
+| Court-boundary filtering | Reject any ball detection whose pixel coordinates project outside the court polygon (with margin for out-of-bounds shots and ball toss). Major false positive reduction. |
+| **Trajectory layer** | Add post-detection trajectory processing: (1) **Temporal smoothing** — Kalman filter or Savitzky-Golay on detected positions. (2) **Gap interpolation** — for gaps ≤ N frames, interpolate using motion model (constant velocity / constant acceleration). (3) **Physical constraint filtering** — reject detections that violate max ball speed (~80 m/s) or imply impossible acceleration. This converts sparse, noisy per-frame detections into continuous, physically plausible trajectories. |
+| Far-court crop detection | Run V5 a **second time** on a 2x-zoomed crop of the far court region (where ball is tiny). Merge detections from full-frame + crop passes. This directly addresses the "ball too small at far end" problem. |
+| Measure improvement | Re-run three-layer scoring harness. Compare all metrics against Week 1 baseline. |
 
 **Go/No-Go:**
 - ✅ Court detection finds **≥4 keypoints on ≥80%** of sampled frames
 - ✅ Court-boundary filtering reduces false positives by **≥20%**
-- ✅ Overall detection rate **≥25% of frames**
+- ✅ Trajectory layer reduces break rate by **≥50%** vs raw detections
+- ✅ Overall detection rate **≥40% of frames** (after trajectory interpolation)
 - ❌ <4 keypoints → courtside angle too extreme. Fallback: manual 4-corner annotation for this video (annotate once, derive homography).
-- ❌ <25% detection after filtering → domain gap too large for pretrained weights. Trigger Phase 2 fine-tuning early.
+- ❌ <40% detection after filtering + trajectory → domain gap too large for pretrained weights. Trigger Phase 2A fine-tuning early.
 
 ### Week 3: Rally Detection + Video Trimming (User-Facing MVP)
 
@@ -115,8 +176,8 @@ TrackNet's F1 drops from ~95% (broadcast) to potentially **below 50%** on amateu
 
 | Task | Details |
 |------|---------|
-| Rally boundary detection | **Primary signal:** ball activity pattern — continuous detections = rally, sustained gaps = dead time. Tune gap threshold, minimum rally length, minimum detection density. |
-| Audio confirmation (secondary) | Extract audio track. Use [YAMNet](https://github.com/tensorflow/models/tree/master/research/audioset/yamnet) or simple FFT peak detection for ball-impact sounds (2-4kHz). Use as confidence boost for vision-detected boundaries, NOT as primary signal. Outdoor courts are too noisy for audio-only. |
+| Rally boundary detection | **Primary signal:** ball activity pattern from trajectory layer — continuous trajectory segments = rally, sustained gaps = dead time. Tune gap threshold, minimum rally length, minimum detection density. The trajectory layer from Week 2 should make this significantly more reliable than raw per-frame detections. |
+| Audio confirmation (optional) | Extract audio track. Use [YAMNet](https://github.com/tensorflow/models/tree/master/research/audioset/yamnet) or simple FFT peak detection for ball-impact sounds (2-4kHz). Use as confidence boost for vision-detected boundaries, NOT as primary signal. Outdoor courts are too noisy for audio-only. **Only pursue if vision-only rally detection doesn't meet go/no-go.** |
 | ffmpeg auto-clipping | Cut video at rally timestamps with 2-3 sec buffer. Output: one clip per rally + one full highlights video with dead time removed. |
 | Rally stats JSON | Count, duration, estimated shot count per rally. Output alongside video. |
 | End-to-end demo | Upload 10-min raw match → pipeline → trimmed highlights + `results.json`. |
@@ -124,9 +185,24 @@ TrackNet's F1 drops from ~95% (broadcast) to potentially **below 50%** on amateu
 **Go/No-Go:**
 - ✅ Rally boundaries match manual annotation with **≥70% IoU**
 - ✅ **≥50% of real rallies** detected with **≤30% false positives**
-- ✅ Trimmed output looks reasonable to a human viewer
-- ❌ <50% rally detection → ball tracking still too sparse. Pivot to audio-primary rally detection (YAMNet) with ball activity as secondary.
+- ✅ Trimmed output looks reasonable to a human viewer ("shareable" quality)
+- ❌ <50% rally detection → check if trajectory layer gaps are the bottleneck. If so, consider CoTracker for trajectory completion (see Ablation Experiments E5). If trajectory is fine but rally logic is wrong, tune thresholds.
 - ❌ Output is garbage → validates that pretrained models aren't enough. Budget 4-6 weeks for fine-tuning (Phase 2).
+
+---
+
+## Ablation Experiments
+
+Run on the golden test set. Report all three metric layers. Purpose: **make data-driven decisions about which components are worth the complexity.**
+
+| ID | Experiment | What it tests |
+|----|-----------|---------------|
+| E1 | V2 (current) vs V5 (no other changes) | Is V5 a meaningful upgrade on our domain? |
+| E2 | V5 + trajectory layer vs V5 raw | Does smoothing/interpolation improve rally detection? |
+| E3 | E2 + court-boundary filtering vs E2 | Does geometric filtering help or hurt (risk: filtering out valid lobs/toss)? |
+| E4 | E3 + far-court multi-scale ROI vs E3 | Is "ball too small at far end" the main bottleneck? |
+| E5 | E4 + CoTracker trajectory completion vs E4 + simple interpolation | Is a learned tracker worth the complexity over linear/motion-model interpolation? Only run if trajectory breaks remain a problem after E4. |
+| E6 | Vision-only rally segmentation vs vision + YAMNet audio | Does audio actually improve rally boundary detection? Test across indoor/outdoor/windy conditions. |
 
 ---
 
@@ -139,9 +215,9 @@ Prioritized by user value per effort. Only pursue after Phase 1 MVP demo works.
 Trigger: Phase 1 metrics don't meet go/no-go criteria.
 
 - Collect 20-30 diverse amateur courtside match videos from YouTube
-- Run current model as **pre-labeler** → export detections as CVAT annotations
+- Run V5 as **pre-labeler** → export detections as CVAT annotations
 - Manually correct labels (~2-4 hours per minute of video — this is the bottleneck)
-- Fine-tune TrackNet V4 on courtside dataset
+- Fine-tune TrackNet V5 on courtside dataset
 - Alternative: [soumvincent/TracknetV3-tennis](https://github.com/soumvincent/TracknetV3-tennis) (pre-fine-tuned, >94.8% accuracy) — try this first before labeling from scratch
 
 ### 2B: Bounce Detection + Shot Placement Heatmaps (1-2 weeks)
@@ -166,10 +242,10 @@ Trigger: Phase 1 metrics don't meet go/no-go criteria.
 
 ### 2E: On-Device Deployment (6-8 weeks)
 
-- PyTorch → ONNX → CoreML (iOS) via [coremltools](https://github.com/apple/coremltools)
+- PyTorch → CoreML directly via [coremltools](https://github.com/apple/coremltools) (preferred for iOS; ONNX intermediate step not required)
 - PyTorch → ONNX → [ONNX Runtime](https://github.com/microsoft/onnxruntime) (Android)
 - Quantize to float16 / int8 for Neural Engine / NNAPI acceleration
-- TrackNet V4 is lightweight enough for ~30fps on A15+ chips
+- TrackNet V5 is lightweight enough for ~30fps on A15+ chips (similar parameter count to V4)
 - Start with **post-game processing** (upload → wait → results). Real-time is a separate project.
 
 ### 2F: Real-Time Processing (8+ weeks)
@@ -185,12 +261,13 @@ Trigger: Phase 1 metrics don't meet go/no-go criteria.
 
 | Component | Resource | URL |
 |-----------|----------|-----|
-| Zero-shot detection | Florence-2 | <https://huggingface.co/microsoft/Florence-2-large> |
-| Zero-shot detection | YOLO-World | <https://github.com/AILab-CVC/YOLO-World> |
-| Point tracking | CoTracker (Meta) | <https://github.com/facebookresearch/co-tracker> |
-| Player detection | YOLOv8-nano (ultralytics) | <https://github.com/ultralytics/ultralytics> |
-| Ball tracking (V4) | tracknet-series-pytorch | <https://github.com/AnInsomniacy/tracknet-series-pytorch> |
+| Ball tracking (primary) | TrackNet V5 | TBD — check for official repo release |
+| Ball tracking (V4 fallback) | tracknet-series-pytorch | <https://github.com/AnInsomniacy/tracknet-series-pytorch> |
 | Ball tracking (V3 fine-tuned) | TracknetV3-tennis | <https://github.com/soumvincent/TracknetV3-tennis> |
+| Zero-shot detection (pseudo-labeling) | Florence-2 | <https://huggingface.co/microsoft/Florence-2-large> |
+| Zero-shot detection (pseudo-labeling) | YOLO-World | <https://github.com/AILab-CVC/YOLO-World> |
+| Trajectory completion (optional) | CoTracker (Meta) | <https://github.com/facebookresearch/co-tracker> |
+| Player detection | YOLOv8-nano (ultralytics) | <https://github.com/ultralytics/ultralytics> |
 | Court detection | TennisCourtDetector | <https://github.com/yastrebksv/TennisCourtDetector> |
 | Court detection (amateur) | arxiv:2404.06977 | <https://arxiv.org/abs/2404.06977> |
 | Reference pipeline | tennis_analysis | <https://github.com/abdullahtarek/tennis_analysis> |
@@ -207,13 +284,14 @@ Trigger: Phase 1 metrics don't meet go/no-go criteria.
 
 | Risk | Likelihood | Impact | Mitigation |
 |------|-----------|--------|------------|
-| **TrackNet V4 still fails on courtside video** | Medium | Critical — blocks everything | Try soumvincent V3 fork first. If both fail, trigger Phase 2A fine-tuning early. Far-court crop + court filtering may bridge the gap. |
+| **TrackNet V5 repo not publicly available yet** | Medium | High — blocks primary model | Fallback: use V4 from tracknet-series-pytorch. V4 is still a significant upgrade over V2. Monitor for V5 release. |
+| **V5 still fails on courtside video** | Medium | Critical — blocks everything | Recording spec compliance first. Then try soumvincent V3 fork. If both fail, trigger Phase 2A fine-tuning early. Far-court crop + court filtering + trajectory layer may bridge the gap. |
 | **Court detection unreliable at oblique angles** | Medium | High — blocks filtering + heatmaps | Fallback: manual 4-corner annotation per video (one-time, ~30 sec). Not scalable but unblocks MVP demo. |
-| **Labeling bottleneck (if fine-tuning needed)** | High (if triggered) | High — 4-6 weeks of tedious work | Use current model as pre-labeler. Pre-labels make correction 3-4x faster than labeling from scratch. Start with 5 diverse videos, not 30. |
-| **VRAM constraints (8GB)** | Low | Medium | TrackNet V4 ~2GB. Sequence court detection and ball tracking (don't run simultaneously). Monitor with `nvidia-smi`. |
-| **Audio unreliable outdoors** | Medium | Low — audio is secondary signal | Audio is supplementary only. If it doesn't help, skip it. Rally detection works on vision alone. |
+| **Labeling bottleneck (if fine-tuning needed)** | High (if triggered) | High — 4-6 weeks of tedious work | Use V5 as pre-labeler. Pre-labels make correction 3-4x faster than labeling from scratch. Start with 5 diverse videos, not 30. |
+| **VRAM constraints (8GB)** | Low | Medium | TrackNet V5 ~2GB (similar to V4). Sequence court detection and ball tracking (don't run simultaneously). Monitor with `nvidia-smi`. |
+| **Non-compliant recording kills detection** | High | Critical | Input quality gate rejects bad video upfront with actionable guidance. Users learn correct setup on first attempt. |
+| **Audio unreliable outdoors** | Medium | Low — audio is optional secondary signal | Audio is supplementary only. If it doesn't help, skip it. Rally detection works on vision + trajectory layer alone. |
 | **Scope creep** | High | Medium | This roadmap is the scope. No shot classification, no heatmaps, no on-device in MVP. Resist. |
-| **Missing test video** | Low | Medium — blocks Week 1 | Record one at next court session. Or download courtside amateur match from YouTube for initial testing. |
 
 ---
 
@@ -221,10 +299,31 @@ Trigger: Phase 1 metrics don't meet go/no-go criteria.
 
 SwingVision's moat is **data** — years of labeled footage from professional partnerships. We cannot match this. Our strategy:
 
-1. **Leverage open-source models** (TrackNet V4, TennisCourtDetector) instead of training from scratch
+1. **Leverage open-source models** (TrackNet V5, TennisCourtDetector) instead of training from scratch
 2. **Focus on the auto-clip use case first** — this is what amateur players want most and requires less precision than line calling
 3. **Build a data flywheel**: every video processed becomes potential training data for fine-tuning later
 4. **Target "good enough" accuracy** — users want highlights and rough stats, not Hawk-Eye precision
+5. **Constrain input quality** — like SwingVision, enforce recording requirements to keep the problem tractable
+
+---
+
+## Annotation Guidelines
+
+### What to label
+- **In-play balls only:** label ball position during rallies and serves (ball in flight, bouncing, or rolling during active play)
+- **Dead balls:** do NOT label balls sitting still between points. TrackNet training datasets (V2/V3/V4) are rally-centric — they only contain frames from serve-to-score segments
+- **One ball per frame:** label only the match ball, ignore stray balls on sidelines
+
+### Visibility attribute
+Add a `visibility` attribute to the `ball` label in CVAT:
+- `visible` — ball clearly identifiable (default)
+- `hard_to_see` — ball in frame but blurry/small/camouflaged
+- `occluded` — ball obscured by player/net but position can be estimated from neighboring frames
+
+### Why this matters
+- TrackNet training uses binary heatmap supervision (present vs absent). Occluded balls labeled with estimated positions preserve positive supervision and teach the model to track through occlusion.
+- Downstream rally detection uses detection density as primary signal. Dead ball detections would blur rally/non-rally boundaries.
+- This is consistent with the original TrackNet dataset methodology (clips from serve-to-score, visibility classes 0-3).
 
 ---
 
@@ -233,5 +332,6 @@ SwingVision's moat is **data** — years of labeled footage from professional pa
 - **Harness:** Copilot CLI (Planner/Generator/Evaluator) for code generation sprints
 - **Primary dev:** Windows machine (GPU)
 - **Orchestration/monitoring:** MacBook Air via OpenClaw
-- **Metrics-driven:** Every change measured against baseline. No vibes-based evaluation.
+- **Metrics-driven:** Every change measured against golden test set baseline. No vibes-based evaluation.
 - **Weekly checkpoints:** Go/no-go gates with concrete thresholds. Pivot early if numbers are bad.
+- **CI regression:** Golden test set runs automatically on every model/pipeline change. Metric regression beyond threshold blocks merge.
