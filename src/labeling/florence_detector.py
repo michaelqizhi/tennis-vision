@@ -1,7 +1,8 @@
 """Florence-2 zero-shot ball detector for the labeling pipeline.
 
 Uses ``microsoft/Florence-2-large`` from HuggingFace with the
-``<OD>`` (object detection) task and filters results for "tennis ball".
+``<CAPTION_TO_PHRASE_GROUNDING>`` task and the text prompt "tennis ball"
+to locate the ball in each frame.
 """
 
 import logging
@@ -26,6 +27,7 @@ class FlorenceDetector(BaseDetector):
         self._model = None
         self._processor = None
         self._device: str = "cpu"
+        self._dtype = None
 
     @property
     def name(self) -> str:
@@ -55,12 +57,15 @@ class FlorenceDetector(BaseDetector):
         ).to(device)
         self._model.eval()
         self._device = device
+        self._dtype = torch_dtype
 
     def detect(self, frame: np.ndarray) -> Optional[tuple[float, float, float]]:
-        """Detect tennis ball using open-vocabulary object detection.
+        """Detect tennis ball using phrase grounding.
 
-        Uses the ``<OD>`` task prompt. Filters detections for labels
-        containing 'ball'.
+        Uses the ``<CAPTION_TO_PHRASE_GROUNDING>`` task with the text
+        prompt ``"tennis ball"`` so Florence-2 searches specifically for
+        a tennis ball rather than relying on the fixed ``<OD>`` vocabulary
+        (which never includes "ball").
         """
         if self._model is None or self._processor is None:
             raise RuntimeError("Model not loaded — call load() first")
@@ -72,9 +77,16 @@ class FlorenceDetector(BaseDetector):
         rgb = frame[:, :, ::-1]
         pil_img = Image.fromarray(rgb)
 
-        task = "<OD>"
-        inputs = self._processor(text=task, images=pil_img, return_tensors="pt")
-        inputs = {k: v.to(self._device) for k, v in inputs.items()}
+        task = "<CAPTION_TO_PHRASE_GROUNDING>"
+        prompt = task + "tennis ball"
+        inputs = self._processor(text=prompt, images=pil_img, return_tensors="pt")
+        # Cast float tensors to model dtype to avoid float32/float16 mismatch
+        inputs = {
+            k: v.to(self._device, dtype=self._dtype)
+            if v.is_floating_point()
+            else v.to(self._device)
+            for k, v in inputs.items()
+        }
 
         with torch.no_grad():
             generated_ids = self._model.generate(
@@ -91,7 +103,6 @@ class FlorenceDetector(BaseDetector):
             generated_text, task=task, image_size=(pil_img.width, pil_img.height),
         )
 
-        # result[task] has 'bboxes' and 'labels'
         detections = result.get(task, {})
         bboxes = detections.get("bboxes", [])
         labels = detections.get("labels", [])
@@ -100,18 +111,18 @@ class FlorenceDetector(BaseDetector):
         smallest_area = float("inf")
 
         for bbox, label in zip(bboxes, labels):
-            if "ball" not in label.lower():
-                continue
             x1, y1, x2, y2 = bbox
             area = (x2 - x1) * (y2 - y1)
-            # Pick the smallest ball-like detection (tennis ball is small)
+            # Pick the smallest detection (tennis ball is small)
             if area < smallest_area:
                 smallest_area = area
                 cx = (x1 + x2) / 2.0
                 cy = (y1 + y2) / 2.0
-                # Confidence proxy: inverse of area (smaller = more likely tennis ball)
-                conf = max(0.0, min(1.0, 1.0 - area / (frame.shape[0] * frame.shape[1])))
-                best = (cx, cy, conf)
+                # Florence-2 does not provide per-detection confidence
+                # scores.  Use a fixed value so downstream consumers
+                # (e.g. consensus engine) don't mistake this for a
+                # calibrated probability.
+                best = (cx, cy, 0.5)
 
         return best
 
