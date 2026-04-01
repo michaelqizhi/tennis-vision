@@ -137,7 +137,7 @@ Metrics are organized in **three layers** — improvements must be measured at a
 | Auxiliary model runs | Run Florence-2 and YOLO-World on the same test clips — **not as primary model candidates**, but to (a) characterize their detection patterns for pseudo-labeling consensus, and (b) identify V5's specific failure modes by comparing where they disagree. |
 | Add YOLOv8-nano player detection | Off-the-shelf person detector (~100+ fps). Use player bounding boxes as a prior: reject ball detections far from both players. Zero training required. Free signal. |
 | Video stabilization | Test with and without OpenCV VidStab. May help (shaky video) or hurt (interpolation artifacts on small targets, corruption of V5 motion features). Keep whichever scores better on the metrics harness. |
-| Ground truth annotation | Annotate **3 minutes** (~5400 frames at 30fps, ~10800 at 60fps) for ball position + visibility attribute (`visible` / `hard_to_see` / `occluded`) + **10-15 rally boundaries** on 1 test clip. Use [CVAT](https://github.com/cvat-ai/cvat) video interpolation mode (annotate every 5th frame, let CVAT interpolate between). ~3-4 hours. Label only in-play balls (during rallies/serves), not dead balls between points. |
+| Ground truth annotation | Annotate **3 minutes** (~5400 frames at 30fps, ~10800 at 60fps) for ball position + visibility attribute (`visible` / `occluded`) + **10-15 rally boundaries** on 1 test clip. Use [CVAT](https://github.com/cvat-ai/cvat) video interpolation mode (annotate every 5th frame, let CVAT interpolate between). ~3-4 hours. Label only in-play balls (during rallies/serves), not dead balls between points. |
 | Scoring harness | Build automated three-layer metrics (frame-level, trajectory, event-level). |
 | V5 baseline measurement | Run V5 on test video, record all three metric layers. Compare against V2 to quantify the upgrade. |
 
@@ -316,9 +316,8 @@ SwingVision's moat is **data** — years of labeled footage from professional pa
 
 ### Visibility attribute
 Add a `visibility` attribute to the `ball` label in CVAT:
-- `visible` — ball clearly identifiable (default)
-- `hard_to_see` — ball in frame but blurry/small/camouflaged
-- `occluded` — ball obscured by player/net but position can be estimated from neighboring frames
+- `visible` — ball identifiable in frame, position marked (default)
+- `occluded` — ball obscured by player/net but position estimated from neighboring frames
 
 ### Why this matters
 - TrackNet training uses binary heatmap supervision (present vs absent). Occluded balls labeled with estimated positions preserve positive supervision and teach the model to track through occlusion.
