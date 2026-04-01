@@ -41,3 +41,6 @@ uploads/
 
 # Build artifacts
 *.egg-info/
+
+*.pt
+yolov8*.pt
