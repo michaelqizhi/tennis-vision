@@ -19,7 +19,7 @@ from src.api.schemas import (
     VisualizationPaths,
 )
 from src.api.tasks import Job
-from src.config import load_config
+from src.config import Config, load_config
 from src.features.ball_tracking import BallDetection, BallTracker
 from src.features.court_detect import (
     CourtDetector,
@@ -37,7 +37,7 @@ from src.features.serve_analysis import (
     detect_double_faults,
     compute_serve_stats,
 )
-from src.features.visualization import render_shot_heatmap, render_serve_placement
+from src.features.visualization import render_shot_heatmap, render_serve_placement, render_pixel_heatmap
 from src.video.reader import VideoReader
 
 logger = logging.getLogger(__name__)
@@ -63,6 +63,22 @@ def run_pipeline(job: Job) -> None:
     """
     config = load_config()
     output_dir = _ensure_output_dir(job)
+
+    try:
+        _run_pipeline_steps(job, config, output_dir)
+    finally:
+        # ── Cleanup: remove uploaded temp file even on failure ──────
+        try:
+            video_path = Path(job.video_path)
+            if video_path.exists():
+                video_path.unlink()
+                logger.info("[%s] Cleaned up temp file: %s", job.job_id, job.video_path)
+        except Exception:
+            logger.warning("[%s] Failed to clean up temp file: %s", job.job_id, job.video_path)
+
+
+def _run_pipeline_steps(job: Job, config: Config, output_dir: Path) -> None:
+    """Execute all pipeline steps. Separated so run_pipeline can wrap in try/finally."""
 
     # ── Read video metadata (no frames loaded) ─────────────────────
     logger.info("[%s] Opening video: %s", job.job_id, job.video_path)
@@ -131,13 +147,13 @@ def run_pipeline(job: Job) -> None:
     logger.info("[%s] Ball tracking complete: %d detections",
                 job.job_id, sum(1 for d in detections if d.detected))
 
-    # ── Step 4: Rally detection ─────────────────────────────────────
+    # ── Step 3: Rally detection ─────────────────────────────────────
     job.update_progress(PipelineStep.RALLY_DETECTION, "Detecting rally boundaries...")
     rallies: list[Rally] = detect_rallies(detections, fps)
     job.complete_step(PipelineStep.RALLY_DETECTION, f"Found {len(rallies)} rallies")
     logger.info("[%s] Rally detection: %d rallies", job.job_id, len(rallies))
 
-    # ── Step 5: Rally stats ─────────────────────────────────────────
+    # ── Step 4: Rally stats ─────────────────────────────────────────
     job.update_progress(PipelineStep.RALLY_STATS, "Counting shots per rally...")
     rally_shots: list[RallyShots] = count_all_rally_shots(
         detections, rallies, homography=homography, frame_height=frame_height
@@ -147,7 +163,7 @@ def run_pipeline(job: Job) -> None:
     logger.info("[%s] Rally stats: %d shots in %d rallies",
                 job.job_id, rally_stats_obj.total_shots, rally_stats_obj.rally_count)
 
-    # ── Step 6: Serve analysis ──────────────────────────────────────
+    # ── Step 5: Serve analysis ──────────────────────────────────────
     job.update_progress(PipelineStep.SERVE_ANALYSIS, "Analyzing serves...")
     serves = []
     double_faults = []
@@ -160,11 +176,19 @@ def run_pipeline(job: Job) -> None:
         serve_stats_dict = serve_stats_obj.to_dict()
         job.complete_step(PipelineStep.SERVE_ANALYSIS,
                           f"{serve_stats_obj.total_serves} serves, {serve_stats_obj.double_faults} double faults")
+    elif len(rallies) > 0:
+        # No homography — report basic serve count (one per rally) without placement data
+        serve_stats_dict = {
+            "total_serves": len(rallies),
+            "first_serves": len(rallies),
+        }
+        job.complete_step(PipelineStep.SERVE_ANALYSIS,
+                          f"Estimated {len(rallies)} serves (no court homography — placement unavailable)")
     else:
         job.complete_step(PipelineStep.SERVE_ANALYSIS,
-                          "Skipped — no homography or no rallies detected")
+                          "No rallies detected — serve analysis skipped")
 
-    # ── Step 7: Visualization ───────────────────────────────────────
+    # ── Step 6: Visualization ───────────────────────────────────────
     job.update_progress(PipelineStep.VISUALIZATION, "Generating heatmaps...")
     viz_paths = VisualizationPaths()
 
@@ -184,6 +208,22 @@ def run_pipeline(job: Job) -> None:
             viz_paths.shot_heatmap = f"/output/{job.job_id}/shot_heatmap.png"
         except Exception:
             logger.exception("[%s] Failed to render shot heatmap", job.job_id)
+    elif homography is None:
+        # Pixel-coordinate fallback when no homography
+        pixel_positions = [
+            (d.x, d.y) for d in detections if d.detected and d.x is not None and d.y is not None
+        ]
+        if len(pixel_positions) >= 3:
+            try:
+                heatmap_path = str(output_dir / "shot_heatmap.png")
+                render_pixel_heatmap(
+                    pixel_positions, heatmap_path,
+                    frame_width=frame_width, frame_height=frame_height,
+                    title="Ball Position Heatmap (Pixel Coordinates)",
+                )
+                viz_paths.shot_heatmap = f"/output/{job.job_id}/shot_heatmap.png"
+            except Exception:
+                logger.exception("[%s] Failed to render pixel heatmap fallback", job.job_id)
 
     # Serve placement heatmaps
     if serve_stats_dict:
@@ -207,7 +247,12 @@ def run_pipeline(job: Job) -> None:
                 except Exception:
                     logger.exception("[%s] Failed to render %s heatmap", job.job_id, label)
 
-    job.complete_step(PipelineStep.VISUALIZATION, "Heatmaps generated")
+    heatmap_count = sum(1 for v in [viz_paths.shot_heatmap, viz_paths.serve_heatmap_all,
+                                     viz_paths.serve_heatmap_first, viz_paths.serve_heatmap_second] if v)
+    if heatmap_count > 0:
+        job.complete_step(PipelineStep.VISUALIZATION, f"{heatmap_count} heatmap(s) generated")
+    else:
+        job.complete_step(PipelineStep.VISUALIZATION, "No heatmaps generated — insufficient data")
 
     # ── Build results ───────────────────────────────────────────────
     ball_positions_out: list[BallPositionOut] = []
@@ -230,7 +275,7 @@ def run_pipeline(job: Job) -> None:
                     if court_pts:
                         bp.court_x, bp.court_y = court_pts[0]
                 except Exception:
-                    pass
+                    logger.debug("[%s] Failed to transform court coords for frame %d", job.job_id, bp.frame_number)
 
     rallies_out = [
         RallyOut(
@@ -278,14 +323,5 @@ def run_pipeline(job: Job) -> None:
     )
 
     job.results = results.model_dump()
-
-    # ── Cleanup: remove uploaded temp file ─────────────────────────
-    try:
-        video_path = Path(job.video_path)
-        if video_path.exists():
-            video_path.unlink()
-            logger.info("[%s] Cleaned up temp file: %s", job.job_id, job.video_path)
-    except Exception:
-        logger.warning("[%s] Failed to clean up temp file: %s", job.job_id, job.video_path)
 
     logger.info("[%s] Pipeline complete", job.job_id)

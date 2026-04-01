@@ -4,13 +4,10 @@ All ball detection models must implement the BaseDetector abstract class
 so the inference runner can treat them uniformly.
 """
 
-import logging
 from abc import ABC, abstractmethod
 from typing import Optional
 
 import numpy as np
-
-logger = logging.getLogger(__name__)
 
 
 class BaseDetector(ABC):

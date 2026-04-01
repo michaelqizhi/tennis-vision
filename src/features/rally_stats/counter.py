@@ -57,9 +57,13 @@ def count_shots_pixel(
             duration=rally.duration,
         )
 
-    # Count direction reversals in y-axis (ball going up vs down)
+    # Smooth y-values to reduce noise from jittery detections
     y_values = [d.y for d in rally_dets if d.y is not None]
-    direction_changes = _count_direction_changes(y_values, min_displacement=20.0)
+    y_values = _smooth_trajectory(y_values, window=5)
+
+    # Count direction reversals in y-axis (ball going up vs down)
+    # Use larger min_displacement for pixel space to filter out tracking noise
+    direction_changes = _count_direction_changes(y_values, min_displacement=frame_height * 0.08)
 
     # Count crossings of the approximate net line (midpoint of frame)
     net_y = frame_height / 2.0
@@ -68,6 +72,10 @@ def count_shots_pixel(
     # Use the higher of the two metrics as shot count
     # +1 because the first shot doesn't produce a direction change
     shot_count = max(direction_changes, net_crossings) + 1
+
+    # Sanity cap: no more than ~1 shot per second is physically plausible
+    max_shots = max(1, int(rally.duration * 1.0))
+    shot_count = min(shot_count, max_shots)
 
     return RallyShots(
         rally_id=rally.rally_id,
@@ -131,13 +139,20 @@ def count_shots_court(
     court_pts = cv2.perspectiveTransform(pixel_pts, homography)
     court_y = court_pts[:, 0, 1].tolist()
 
+    # Smooth to reduce noise
+    court_y = _smooth_trajectory(court_y, window=5)
+
     # Count net crossings (y=0 in court coordinates)
     net_crossings = _count_crossings(court_y, crossing_value=0.0)
 
     # Count direction reversals in court y
-    direction_changes = _count_direction_changes(court_y, min_displacement=1.0)
+    direction_changes = _count_direction_changes(court_y, min_displacement=2.0)
 
     shot_count = max(direction_changes, net_crossings) + 1
+
+    # Sanity cap: no more than ~1 shot per second is physically plausible
+    max_shots = max(1, int(rally.duration * 1.0))
+    shot_count = min(shot_count, max_shots)
 
     return RallyShots(
         rally_id=rally.rally_id,
@@ -177,6 +192,35 @@ def count_all_rally_shots(
             shots = count_shots_pixel(detections, rally, frame_height)
         results.append(shots)
     return results
+
+
+def _smooth_trajectory(
+    values: list[float],
+    window: int = 5,
+) -> list[float]:
+    """Apply a simple moving average to smooth noisy trajectory data.
+
+    Args:
+        values: Raw 1D signal values.
+        window: Smoothing window size (must be odd and ≥1).
+
+    Returns:
+        Smoothed values (same length as input).
+    """
+    if len(values) <= 2 or window <= 1:
+        return values
+
+    window = min(window, len(values))
+    if window % 2 == 0:
+        window -= 1
+
+    half = window // 2
+    smoothed = []
+    for i in range(len(values)):
+        start = max(0, i - half)
+        end = min(len(values), i + half + 1)
+        smoothed.append(sum(values[start:end]) / (end - start))
+    return smoothed
 
 
 def _count_direction_changes(

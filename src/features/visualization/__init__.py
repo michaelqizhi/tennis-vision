@@ -16,6 +16,7 @@ from src.features.visualization.renderer import (
     render_serve_placement,
     render_court_overlay,
     embed_overlay_in_frame,
+    render_pixel_heatmap,
 )
 
 __all__ = [
@@ -30,4 +31,5 @@ __all__ = [
     "render_serve_placement",
     "render_court_overlay",
     "embed_overlay_in_frame",
+    "render_pixel_heatmap",
 ]

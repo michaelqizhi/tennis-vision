@@ -22,7 +22,6 @@ import time
 from pathlib import Path
 from typing import Optional
 
-import cv2
 import numpy as np
 from tqdm import tqdm
 
@@ -47,7 +46,8 @@ def run_inference(
     device: str = "cpu",
     output_path: Optional[str] = None,
     max_frames: int = 0,
-) -> dict[str, dict[str, Optional[dict]]]:
+    return_timing: bool = False,
+) -> dict[str, dict[str, Optional[dict]]] | tuple[dict[str, dict[str, Optional[dict]]], dict[str, float]]:
     """Run all detectors on a video, sequentially to conserve VRAM.
 
     Args:
@@ -56,71 +56,97 @@ def run_inference(
         device: PyTorch device string.
         output_path: If provided, write ``detections.json`` to this path.
         max_frames: Maximum number of frames to process (0 = all).
+        return_timing: If True, return a tuple of (detections, timing_dict).
 
     Returns:
         Nested dict mapping ``frame_idx → model_name → detection_or_null``.
+        If ``return_timing`` is True, returns ``(detections, timing_dict)``
+        where timing_dict maps model_name → elapsed seconds.
     """
-    reader = VideoReader(video_path, max_frames=max_frames)
-    logger.info(
-        "Video: %s — %d frames, %.1f fps, %dx%d",
-        video_path,
-        reader.frame_count,
-        reader.fps,
-        reader.width,
-        reader.height,
-    )
+    with VideoReader(video_path, max_frames=max_frames) as reader:
+        logger.info(
+            "Video: %s — %d frames, %.1f fps, %dx%d",
+            video_path,
+            reader.frame_count,
+            reader.fps,
+            reader.width,
+            reader.height,
+        )
+        total = reader.frame_count if max_frames == 0 else min(max_frames, reader.frame_count)
 
-    # Pre-read all frames so each detector sees the same data.
-    # For very long videos this will use a lot of RAM; a future
-    # improvement could cache frames to disk instead.
-    logger.info("Reading frames …")
-    frames: list[np.ndarray] = list(reader.iter_frames())
-    reader.release()
-    total = len(frames)
-    logger.info("Read %d frames", total)
+        # Initialize results: frame_idx → {model_name → detection}
+        results: dict[str, dict[str, Optional[dict]]] = {}
+        timing: dict[str, float] = {}
 
-    # Initialize results: frame_idx → {model_name → detection}
-    results: dict[str, dict[str, Optional[dict]]] = {
-        str(i): {} for i in range(total)
-    }
-    timing: dict[str, float] = {}
+        # Stream frames to disk cache to avoid holding all in RAM.
+        # For a 10-min 1080p video at 30fps, full preload would be ~55GB.
+        import tempfile
+        import pickle
 
-    for detector in detectors:
-        model_name = detector.name
-        logger.info("=== Running %s ===", model_name)
-
+        frames_cache_path = None
         try:
-            detector.load(device)
-        except Exception:
-            logger.exception("Failed to load %s — skipping", model_name)
-            for i in range(total):
-                results[str(i)][model_name] = None
-            continue
+            # First pass: cache frames to a temp file
+            logger.info("Caching frames to disk …")
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pkl")
+            frames_cache_path = tmp.name
+            frame_offsets: list[int] = []
+            actual_count = 0
+            for frame in reader.iter_frames():
+                frame_offsets.append(tmp.tell())
+                pickle.dump(frame, tmp)
+                results[str(actual_count)] = {}
+                actual_count += 1
+            tmp.close()
+            total = actual_count
+            logger.info("Cached %d frames", total)
 
-        try:
-            t0 = time.perf_counter()
+            for detector in detectors:
+                model_name = detector.name
+                logger.info("=== Running %s ===", model_name)
 
-            for i, frame in enumerate(tqdm(frames, desc=model_name)):
                 try:
-                    det = detector.detect(frame)
+                    detector.load(device)
                 except Exception:
-                    logger.exception("Error in %s on frame %d", model_name, i)
-                    det = None
-                results[str(i)][model_name] = _serialize_detection(det)
+                    logger.exception("Failed to load %s — skipping", model_name)
+                    for i in range(total):
+                        results[str(i)][model_name] = None
+                    continue
 
-            elapsed = time.perf_counter() - t0
-            fps = total / elapsed if elapsed > 0 else 0.0
-            timing[model_name] = elapsed
-            logger.info(
-                "%s: %.1fs (%.1f fps), %d/%d detections",
-                model_name,
-                elapsed,
-                fps,
-                sum(1 for i in range(total) if results[str(i)][model_name] is not None),
-                total,
-            )
+                try:
+                    t0 = time.perf_counter()
+
+                    with open(frames_cache_path, "rb") as cache_f:
+                        for i in tqdm(range(total), desc=model_name):
+                            frame = pickle.load(cache_f)
+                            try:
+                                det = detector.detect(frame)
+                            except Exception:
+                                logger.exception("Error in %s on frame %d", model_name, i)
+                                det = None
+                            results[str(i)][model_name] = _serialize_detection(det)
+
+                    elapsed = time.perf_counter() - t0
+                    fps_rate = total / elapsed if elapsed > 0 else 0.0
+                    timing[model_name] = elapsed
+                    logger.info(
+                        "%s: %.1fs (%.1f fps), %d/%d detections",
+                        model_name,
+                        elapsed,
+                        fps_rate,
+                        sum(1 for i in range(total) if results[str(i)][model_name] is not None),
+                        total,
+                    )
+                finally:
+                    detector.unload()
+
         finally:
-            detector.unload()
+            # Clean up temp cache
+            if frames_cache_path:
+                try:
+                    import os
+                    os.unlink(frames_cache_path)
+                except OSError:
+                    pass
 
     # Summary
     logger.info("--- Inference Summary ---")
@@ -151,6 +177,8 @@ def run_inference(
                 output_path,
             )
 
+    if return_timing:
+        return results, timing
     return results
 
 
@@ -163,9 +191,13 @@ def get_default_detectors() -> list[BaseDetector]:
     from src.labeling.tracknet_detector import TrackNetDetector
     from src.labeling.florence_detector import FlorenceDetector
     from src.labeling.yoloworld_detector import YOLOWorldDetector
+    from src.labeling.yoloworld_sahi_detector import YOLOWorldSAHIDetector
+    from src.labeling.groundingdino_detector import GroundingDINODetector
 
     return [
         TrackNetDetector(),
         FlorenceDetector(),
         YOLOWorldDetector(),
+        YOLOWorldSAHIDetector(),
+        GroundingDINODetector(),
     ]

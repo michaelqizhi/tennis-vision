@@ -99,10 +99,6 @@ def detect_serves(
     serve_id = 1
     pending_fault: ServeEvent | None = None
 
-    # Interleave fault bursts and rally starts chronologically
-    rally_idx = 0
-    burst_idx = 0
-
     events: list[tuple[str, int]] = []
     for i, rally in enumerate(rallies):
         events.append(("rally", i))
@@ -161,7 +157,7 @@ def detect_serves(
                 server_end=server_end,
                 serve_number=serve_number,
                 start_frame=rally.start_frame,
-                end_frame=rally.start_frame + int(config.serve_analysis_frames * fps / 30),
+                end_frame=min(rally.start_frame + int(config.serve_analysis_frames * fps / 30), rally.end_frame),
                 landing_position=landing,
                 is_fault=False,
                 is_ace=is_ace,

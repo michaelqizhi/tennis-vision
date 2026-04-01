@@ -237,6 +237,18 @@ class TestFlorenceDetector:
         d = FlorenceDetector()
         d.unload()  # should not raise
 
+    def test_confidence_is_fixed(self):
+        """Florence-2 should return a fixed confidence, not an area proxy."""
+        from src.labeling.florence_detector import FlorenceDetector
+        d = FlorenceDetector()
+        # Simulate what detect() does with the confidence calculation
+        # by checking the source directly — any detection should have conf=0.5
+        # We can't run real inference, but we can verify the constant
+        import inspect
+        source = inspect.getsource(FlorenceDetector.detect)
+        assert "0.5)" in source, "Florence detect() should use fixed 0.5 confidence"
+        assert "area / (frame" not in source, "Florence should not use area-based confidence"
+
 
 # ---------------------------------------------------------------------------
 # YOLO-World Detector
@@ -404,6 +416,35 @@ class TestInferenceRunner:
         # detect() errors are caught per-frame, so run completes normally
         run_inference(video_path, [detector])
         assert detector.was_unloaded
+
+    def test_video_reader_released_on_iter_error(self, tmp_path):
+        """VideoReader should be released even if iter_frames() raises."""
+        video_path = self._make_test_video(tmp_path, n_frames=3)
+        detector = DummyDetector([(1.0, 2.0, 0.5)] * 3)
+
+        # Patch iter_frames to raise after yielding one frame
+        orig_iter = None
+
+        def _exploding_iter(self_reader):
+            yield _make_frame()
+            raise IOError("corrupt video")
+
+        with patch("src.labeling.inference_runner.VideoReader") as MockReader:
+            mock_instance = MagicMock()
+            mock_instance.frame_count = 3
+            mock_instance.fps = 30.0
+            mock_instance.width = 640
+            mock_instance.height = 360
+            mock_instance.iter_frames = lambda: _exploding_iter(mock_instance)
+            mock_instance.__enter__ = MagicMock(return_value=mock_instance)
+            mock_instance.__exit__ = MagicMock(return_value=False)
+            MockReader.return_value = mock_instance
+
+            with pytest.raises(IOError, match="corrupt video"):
+                run_inference(video_path, [detector])
+
+            # __exit__ must have been called (context manager ensures release)
+            mock_instance.__exit__.assert_called_once()
 
     def test_json_write_failure_returns_results(self, tmp_path):
         """If JSON write fails, results should still be returned."""

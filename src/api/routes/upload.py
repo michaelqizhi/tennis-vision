@@ -22,6 +22,22 @@ ALLOWED_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
 MAX_FILE_SIZE_MB = 500
 
 
+def _looks_like_video(header: bytes) -> bool:
+    """Check if the file header matches known video container magic bytes."""
+    if len(header) < 12:
+        return False
+    # ISO base media (MP4, MOV, 3GP): bytes 4-8 are 'ftyp'
+    if header[4:8] == b"ftyp":
+        return True
+    # AVI: starts with RIFF
+    if header[:4] == b"RIFF" and header[8:12] == b"AVI ":
+        return True
+    # MKV / WebM: EBML header
+    if header[:4] == b"\x1a\x45\xdf\xa3":
+        return True
+    return False
+
+
 @router.post(
     "/upload",
     response_model=UploadResponse,
@@ -53,6 +69,7 @@ async def upload_video(file: UploadFile = File(..., description="Tennis match vi
             dir=str(uploads_dir), suffix=ext, delete=False
         ) as tmp:
             size = 0
+            header: bytes = b""
             while chunk := await file.read(1024 * 1024):  # 1 MB chunks
                 size += len(chunk)
                 if size > MAX_FILE_SIZE_MB * 1024 * 1024:
@@ -61,17 +78,39 @@ async def upload_video(file: UploadFile = File(..., description="Tennis match vi
                         status_code=413,
                         detail=f"File too large. Maximum size: {MAX_FILE_SIZE_MB} MB.",
                     )
+                # Capture first 12 bytes for magic check
+                if len(header) < 12:
+                    header += chunk[:12 - len(header)]
                 tmp.write(chunk)
             tmp_path = tmp.name
+
+        # Validate content magic bytes
+        if not _looks_like_video(header):
+            os.unlink(tmp_path)
+            raise HTTPException(
+                status_code=400,
+                detail="File does not appear to be a valid video. Content does not match any supported video format.",
+            )
     except HTTPException:
         raise
     except Exception as exc:
         logger.exception("Failed to save uploaded file")
         raise HTTPException(status_code=500, detail="Failed to save uploaded file.") from exc
+    finally:
+        await file.close()
 
     # Create job and submit to pipeline
-    job = create_job(video_path=tmp_path, filename=file.filename)
-    submit_job(job, run_pipeline)
+    try:
+        job = create_job(video_path=tmp_path, filename=file.filename)
+        submit_job(job, run_pipeline)
+    except Exception:
+        # Clean up temp file if job creation/submission fails
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        logger.exception("Failed to create/submit job for %s", file.filename)
+        raise HTTPException(status_code=500, detail="Failed to start processing job.")
 
     logger.info("Job %s created for file %s (%d bytes)", job.job_id, file.filename, size)
     return UploadResponse(job_id=job.job_id)

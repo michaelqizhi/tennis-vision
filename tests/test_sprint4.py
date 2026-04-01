@@ -498,17 +498,20 @@ class TestBenchmarkReport:
 
 
 class TestInferenceRunnerV4:
-    """Test that inference runner includes TrackNet V4."""
+    """Test that inference runner includes expected detectors."""
 
-    def test_default_detectors_includes_v4(self):
-        """Default detectors list includes TrackNet V4."""
+    def test_default_detectors_includes_expected(self):
+        """Default detectors list includes expected detectors."""
         from src.labeling.inference_runner import get_default_detectors
 
         detectors = get_default_detectors()
         names = [d.name for d in detectors]
-        assert "tracknet_v4" in names
         assert "tracknet_v2" in names
-        assert len(detectors) == 4  # V2, V4, Florence, YOLO-World
+        assert "florence_2" in names
+        assert "yolo_world" in names
+        assert "yolo_world_sahi" in names
+        assert "grounding_dino" in names
+        assert len(detectors) == 5
 
     def test_return_timing_flag(self):
         """run_inference with return_timing returns tuple."""

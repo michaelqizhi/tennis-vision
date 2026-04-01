@@ -41,20 +41,35 @@ def _postprocess_heatmap(
     min_radius: int = 10,
     max_radius: int = 25,
 ) -> tuple[float | None, float | None]:
-    """Extract keypoint (x, y) from a single heatmap using HoughCircles.
+    """Extract keypoint (x, y) from a single heatmap using weighted centroid.
+
+    Uses cv2.moments weighted centroid as the primary method, with HoughCircles
+    as a secondary fallback. Weighted centroid is more robust for courtside
+    footage where heatmap peaks can be elliptical rather than circular.
 
     Args:
         heatmap: 2D heatmap, values in [0, 255].
         scale_x: Scale factor for X (model output width → input image width).
         scale_y: Scale factor for Y (model output height → input image height).
         low_thresh: Binary threshold for heatmap.
-        min_radius: Minimum circle radius for HoughCircles.
-        max_radius: Maximum circle radius for HoughCircles.
+        min_radius: Minimum circle radius for HoughCircles fallback.
+        max_radius: Maximum circle radius for HoughCircles fallback.
 
     Returns:
         (x, y) in scaled image coordinates, or (None, None).
     """
     _, binary = cv2.threshold(heatmap, low_thresh, 255, cv2.THRESH_BINARY)
+
+    # Primary: weighted centroid using cv2.moments
+    moments = cv2.moments(binary)
+    if moments["m00"] > 0:
+        cx = moments["m10"] / moments["m00"]
+        cy = moments["m01"] / moments["m00"]
+        x = float(cx * scale_x)
+        y = float(cy * scale_y)
+        return x, y
+
+    # Fallback: HoughCircles for cases where moments fail
     circles = cv2.HoughCircles(
         binary, cv2.HOUGH_GRADIENT, dp=1, minDist=20,
         param1=50, param2=2, minRadius=min_radius, maxRadius=max_radius,

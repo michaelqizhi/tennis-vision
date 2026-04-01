@@ -1,148 +1,138 @@
-# Feedback — Sprint 12 Evaluation (Post-Sprint 12 Fix Round)
+# Feedback — Sprint 5 Evaluation
+
+**Date:** 2026-04-01
+**Tests:** 283 passed in 7.68s ✓ (243 existing + 40 new)
+**Frontend build:** Next.js 16.2.1 (Turbopack), compiled in 1992ms, zero TS errors ✓
+**Backend startup:** FastAPI starts cleanly, all routes respond correctly ✓
+
+---
 
 ## What Works
-- **Backend starts cleanly** — `uvicorn src.api.main:app --port 8000` starts without errors, health endpoint returns `{"status":"ok","service":"tennis-vision"}` ✓
-- **OpenAPI docs** — Swagger UI at `/docs` available, lists all 5 routes (/health, /upload, /status/{job_id}, /results/{job_id}, /jobs) ✓
-- **All 119 Python tests pass** in 4.78s ✓
-- **All 43 source module imports clean** — Every `.py` under `src/` imports without errors ✓
-- **Upload validation** — Invalid extensions → 400 with correct message, missing file → 422 ✓
-- **Edge case responses** — Non-existent job → 404 for both /status and /results ✓
-- **Frontend builds** — Next.js 16.2.1, TypeScript clean, static pages generated in 1.7s ✓
-- **Progress reporting** — Granular per-frame progress during ball tracking via callback ✓
-- **Pipeline runs on GPU** — Config detects CUDA, pipeline completes in ~2.5 min ✓
-- **Real video end-to-end pipeline completes** — Uploaded `tests/fixtures/tennis_test.mp4` (1801 frames, 30fps, 1920×1080). Pipeline ran all 6 steps and returned `complete` status ✓
-- **Ball tracking produces real detections** — 1345/1801 frames with ball detected (74.7% detection rate). 1134 raw + 211 interpolated. Pixel X: 136.5–1876.5, Y: 154.5–1054.5 — plausible for 1920×1080 ✓
-- **total_frames correct** — Uses `len(frames)` = 1801 (actual decoded), not container metadata ✓
-- **Empty video validation** — `if not frames: raise ValueError(...)` at pipeline.py line 71 ✓
-- **Corrupt/empty file handling** — 0-byte `.mp4` → `FileNotFoundError("Cannot open video")` from VideoReader ✓
-- **Pipeline test mock correct** — `reader.iter_frames.return_value = iter([...] * 90)` at test_api.py line 335 ✓
-- **Frontend heatmap URL prefix correct** — `src={'/api${img.path}'}` at page.tsx line 184, chains through Next.js rewrite to backend `/output/` correctly ✓
-- **Interpolated vs raw detections** — `BallDetection.interpolated` field present, `BallPositionOut.interpolated` field in API schema, pipeline sets `interpolated=det.interpolated` ✓
-- **Rally detector filters interpolated detections** — Gap analysis uses only raw (non-interpolated) detections ✓
-- **BallDetection.detected returns False for NaN** — Prevents NaN positions from being treated as valid detections ✓
-- **`_interpolate_subtrack` handles all-None input** — Returns original `[(None, None), ...]` instead of NaN. Verified: `_interpolate_subtrack([(None,None)]*3)` → `[(None, None), (None, None), (None, None)]` ✓
-- **`/jobs` route exists** — `GET /jobs` returns all jobs, registered in main.py ✓
-- **`read_all()` dead code removed** — `VideoReader` only has `iter_frames()` as the canonical method ✓
-- **Frontend CourtHeatmap coordinate transform** — Uses `cx = pos.court_x! + COURT_WIDTH / 2` and `cy = pos.court_y! + COURT_LENGTH / 2` to convert center-origin to SVG top-left origin ✓
-- **Density computation uses transformed coords** — `computeLocalDensity()` correctly applies same transform before distance calc ✓
-- **pipeline.py no longer overrides max_samples** — Calls `court_detector.get_stable_homography(frames)` without explicit override (uses default 20) ✓
-- **Court detector passes min_radius from config** — `_postprocess_heatmap()` call at detector.py line 250 includes `min_radius=cfg.court_detection.min_radius` ✓
-- **Position-reset rally splitting** — Large jumps (>400px within 0.5s) treated as rally boundaries ✓
+
+- **All 283 tests pass** (243 existing + 40 Sprint 5): zero failures, zero regressions (7.68s)
+- **Backend starts cleanly**: `python -m uvicorn src.api.main:app` starts, all endpoints respond correctly
+- **Root endpoint fixed**: `GET /` now redirects 307 → `/docs` (was 404)
+- **Upload validation**: rejects bad extensions (400), rejects non-video magic bytes (400), enforces 500MB limit (413). Cleanup on startup removed 14 orphaned files
+- **Error responses are clean**: bad job IDs → 404 with `{"detail":"Job 'bad-id' not found."}`, global exception handler catches unhandled errors
+- **Frontend builds**: Next.js 16.2.1 + Turbopack, compiled in 1992ms, zero TypeScript errors, 3 static pages
+- **Frontend components well-structured**: VideoUpload (drag & drop + file input), ProcessingStatus, CourtHeatmap (SVG tennis court with density coloring), RallyStats, ServeStats
+- **Frontend–backend integration correct**: Next.js rewrites `/api/*` → FastAPI, typed polling via `pollUntilComplete()`, proper error handling
+- **Code architecture clean**: ML inference in `src/features/`, thin API routes, orchestration in `src/api/pipeline.py`, labeling pipeline separate
+- **Thread safety infrastructure**: `Job.snapshot()` with `_mutation_lock` + `copy.deepcopy()` exists, single-worker thread pool prevents GPU contention
+
+### Sprint 5 Bug Fixes — Verified ✓
+1. **Race condition fix (Critical #4)** — Routes now use `job.snapshot()`. ✓
+2. **Weighted centroid (Critical #1)** — `cv2.moments` replaces HoughCircles as primary keypoint extraction. ✓
+3. **Stationary detection removal (Critical #2)** — `_remove_stationary()` added, 15px/10-frame threshold. ✓
+4. **Shot count cap (Critical #3)** — Capped at 1 shot/sec × rally duration. ✓
+5. **Serve stats fallback (Non-critical #7)** — Pipeline sets `total_serves = len(rallies)` in response data. ✓
+6. **Frontend lint fix (Non-critical #5)** — Changed to `next lint` (removed `--dir`). ✓
+7. **Root endpoint (Non-critical #8)** — `GET /` → 307 `/docs`. ✓
+8. **Pipeline type annotations** — `Config` type instead of `object`. ✓
+9. **Dead code removal** — `_VIDEO_MAGIC`, dead locals, dead imports all cleaned. ✓
+10. **Step numbering** — Pipeline comments now count Steps 1-6 sequentially. ✓
+11. **Streaming frames in inference runner** — Disk-cached with pickle instead of RAM. ✓
+12. **Player detector + proximity filter** — New Sprint 5 feature, integrated into labeling pipeline. ✓
+
+---
 
 ## Issues Found
 
-### 1. Court detection fails on real video — only 2/14 raw keypoints detected (CRITICAL)
-**File:** `src/features/court_detect/detector.py`
-**Problem:** On the test video, the court detection model finds only 2 raw keypoints out of 14 on every sampled frame (frames 0–200 tested at stride 10, best = 2 keypoints). The minimum for a homography is 4 keypoints. Result: `get_stable_homography()` returns `None`.
-**Impact:** 4 of 5 MVP features depend on court homography. Without it: 0 court-mapped positions, no heatmaps generated, no serve analysis, empty output directory. Only ball tracking in pixel space works.
-**Root cause:** The previous issues (#1 max_samples override, #2 min_radius not passed) have been **fixed**, but court detection still fails. The model simply cannot detect enough keypoints on this camera angle/footage. This is likely a model/weights quality issue or camera angle incompatibility, not a code bug.
-**Suggestion:** Add a fallback: (a) manual keypoint selection UI, (b) try multiple thresholds/parameters automatically, (c) log per-frame detection detail to help debug, (d) consider alternative court detection models/approaches.
+### Critical
 
-### 2. Rally detection produces single 60-second rally (DATA QUALITY)
-**File:** `src/features/auto_clip/rally_detector.py`
-**Problem:** Test video yields 1 rally spanning frames 2–1800 (59.9s, 125 shots). A real 66s clip likely has 3–8 points. The position-reset detection was added but has not produced splits on this video.
-**Impact:** Rally stats are meaningless — 1 rally with 125 shots is not useful analysis.
-**Root cause:** Ball tracking has strong continuous detection (74.7%), so there aren't enough gaps for gap-based splitting. The position-reset threshold (400px) may be too high, or the ball doesn't exhibit large jumps between points in this footage.
-**Suggestion:** Reduce `position_reset_threshold` (try 200px), lower `min_gap_seconds` further, or add y-direction reversal detection at baseline to identify point boundaries.
+### 1. `job.progress` written without lock from pipeline callback
+- **File:** `src/api/pipeline.py:123`
+- **Problem:** `_ball_tracking_progress()` writes `job.progress = (1 + step_progress) / all_steps` directly, without acquiring `job._mutation_lock`. The pipeline runs in a background thread. Meanwhile, `job.snapshot()` reads `self.progress` under the lock. This creates a data race — `snapshot()` may read a partially-written float or observe `progress` inconsistent with the step status.
+- **Impact:** API consumers can see momentarily inconsistent progress values during ball tracking. Low probability of causing actual crashes, but violates the thread-safety model the codebase otherwise follows.
+- **Fix:** Either use `job.update_progress()` (which acquires the lock) or wrap the assignment in `with job._mutation_lock:`.
 
-### 3. Frames still materialized in memory (PERFORMANCE)
-**File:** `src/api/pipeline.py` line 69
-**Problem:** `frames = list(reader.iter_frames())` loads all 1801 frames into memory at once (~3.5 GB for 1920×1080 BGR). For a 2-hour match (~200K frames), this would require ~400 GB RAM.
-**Impact:** Memory usage is excessive. Works for short clips but will OOM on full matches.
-**Noted in checkpoint as known issue.** Not blocking for MVP with short clips.
+### 2. Inference runner temp file not closed before unlink on Windows
+- **File:** `src/labeling/inference_runner.py:90-99`
+- **Problem:** `tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pkl")` opens a file handle. If frame caching raises mid-loop (line 94-98), execution jumps to the `finally` block (line 142-149) which calls `os.unlink(frames_cache_path)`. On Windows, unlinking an open file handle fails silently (caught by `except OSError: pass`), leaving a leaked temp file on disk. Even on the happy path, `tmp.close()` at line 99 only runs after the full frame iteration completes.
+- **Fix:** Use `try/finally` to ensure `tmp.close()` is called even if frame iteration raises. Or use a context manager wrapping the write phase.
 
-### 4. Stale empty output directories accumulate (CODE QUALITY)
-**File:** `output/` directory
-**Problem:** 2 empty job output directories exist (`f167355a4676`, `f5b12ac0a5f3`). These accumulate with each pipeline run. The pipeline creates the directory but when court detection fails, no files are written, leaving empty dirs. Previous round had 22; checkpoint says they were cleaned but 2 new ones have accumulated from this run and the prior evaluation.
-**Fix:** Add cleanup in pipeline for empty output dirs on completion, or add a periodic cleanup mechanism.
+### 3. No API versioning — routes are at `/upload`, `/status/`, not `/api/v1/`
+- **File:** `src/api/main.py:100-103`
+- **Problem:** Routes are mounted at root (`/upload`, `/status/{job_id}`, etc.) with no API prefix. The AGENTS.md spec structure and frontend proxy both assume `/api/` prefix handling, but the actual backend serves at root. This works currently because the Next.js rewrite strips `/api/` before forwarding, but:
+  - API docs show unprefixed paths, confusing for API consumers
+  - No versioning path for breaking changes
+  - Direct backend access (without Next.js proxy) has no API namespace
+- **Impact:** Works but fragile. Not a runtime bug, but an architectural issue that will cause pain when adding API versions or deploying behind a reverse proxy.
 
-### 5. CORS wildcard in production (SECURITY — KNOWN)
-**File:** `src/api/main.py` line 53
-**Problem:** `allow_origins=["*"]` — allows any origin. Acceptable for local dev MVP, but noted.
+### 4. Result payload can be very large — no pagination or streaming for ball positions
+- **File:** `src/api/pipeline.py:258-268`, `src/api/schemas.py:111-121`
+- **Problem:** `AnalysisResults.ball_positions` contains one entry per frame. A 10-min video at 30fps = 18,000 entries → ~2.1 MB JSON response. A 60-min match = ~12.6 MB. This is returned as a single JSON blob with no pagination.
+- **Impact:** Slow frontend rendering, high memory usage, potential timeout on mobile clients.
+- **Fix:** Add pagination to the results endpoint, or return ball positions separately from aggregate stats.
 
-### 6. Thread safety of Job mutations (CONCURRENCY — KNOWN)
-**File:** `src/api/tasks.py`
-**Problem:** `_lock` protects dict-level operations but individual `Job` attribute mutations (status, progress, results) are not atomic. CPython GIL prevents crashes but it's technically a data race. Noted in checkpoint as known issue.
+---
 
-## Fixed Since Last Round (Sprint 11 → Sprint 12)
-1. **pipeline.py max_samples override removed** — No longer passes `max_samples=10`, uses default 20 ✓
-2. **Court detector passes min_radius from config** — `min_radius=cfg.court_detection.min_radius` now in `_postprocess_heatmap()` call ✓
-3. **Frontend CourtHeatmap coordinate transform fixed** — Correctly transforms center-origin to SVG top-left ✓
-4. **`_interpolate_subtrack` handles all-None input** — Returns original coords, no NaN ✓
-5. **`read_all()` dead code removed** — Only `iter_frames()` remains ✓
-6. **`/jobs` route added** — GET /jobs endpoint exists and works ✓
-7. **`BallPositionOut.interpolated` field added** — API schema and pipeline both include it ✓
-8. **Position-reset rally splitting added** — New detection mechanism for rally boundaries ✓
-9. **Rally gap threshold lowered** — `min_gap_seconds` reduced from 2.0 to 1.5 ✓
-10. **Stale output directories cleaned** — Previous 22 empty dirs removed (2 new ones from this evaluation run) ✓
+## Non-Critical Issues
 
-**All 10 issues from Sprint 11 feedback have been addressed.** Issues #1 and #2 above are fundamental limitations (model can't detect this camera angle) rather than code bugs.
+### 5. Frontend polling cannot be cancelled
+- **File:** `frontend/src/lib/api.ts:153-177`
+- `pollUntilComplete()` uses recursive `setTimeout` with no cancellation mechanism. If the user resets or the component unmounts, poll timers keep running and may update stale React state (potential "Can't perform state update on unmounted component" warning).
+- **Fix:** Return an abort function or use `AbortController`.
+
+### 6. Next.js proxy hardcoded to port 8000
+- **File:** `frontend/next.config.ts:11`
+- `destination: "http://127.0.0.1:8000/:path*"` is hardcoded. No startup script or docs coordinate backend port. The backend defaults to port 8000 (uvicorn default), but if started on another port the frontend silently fails to reach it.
+- **Fix:** Use an env variable like `BACKEND_URL`.
+
+### 7. `CourtHeatmap` has O(n²) density computation
+- **File:** `frontend/src/components/CourtHeatmap.tsx:126-146, 173-200`
+- Each ball position computes density by iterating all positions. Even with sampling, `computeMaxDensity` iterates 200 samples × all positions. For 18,000 positions this is 3.6 million distance computations per render.
+- **Fix:** Grid-based binning for density, or use canvas/WebGL instead of SVG for large datasets.
+
+### 8. `load_config()` called repeatedly without caching in pipeline
+- **File:** `src/api/pipeline.py:65`, `src/api/main.py:33`, `src/api/routes/upload.py:62`
+- `load_config()` creates a new `Config` instance each time. `get_config()` (singleton) exists but isn't used. Minor perf issue — Config construction imports torch, which is slow.
+- **Fix:** Use `get_config()` consistently, or cache `load_config()`.
+
+---
+
+## Code Quality
+
+- **Thread safety model is solid** — `Job._mutation_lock`, `snapshot()`, `_set_step_unlocked()` are well-designed. Only the `pipeline.py:123` bypass violates it.
+- **Upload security is good** — temp filenames are securely generated (no path traversal), extensions validated, magic bytes checked, explicit `file.close()`.
+- **No circular imports detected** — import graph is clean and layered.
+- **Type hints present on most public functions** — good coverage.
+- **Config `resolve_path()` allows `..` traversal** — `src/config.py:85-90` doesn't block `../../../etc/passwd` style paths. Low risk since it's only used for model weight paths from config, not user input.
+
+---
+
+## Suggestions for Sprint 6
+
+1. **Fix the `job.progress` lock bypass** — One-line fix in `pipeline.py:123`. Use `with job._mutation_lock:` or `job.update_progress()`.
+2. **Fix inference runner temp file leak on Windows** — Wrap `tmp` write phase in try/finally to ensure `tmp.close()`.
+3. **Test on real video end-to-end** — Sprint 5 checkpoint says "TrackNet V4 weights not yet tested on real video." The weighted centroid + stationary filter fixes need validation on actual footage.
+4. **Add result pagination** — Don't return 18,000+ ball positions in a single JSON response. Either paginate or separate ball_positions into its own endpoint.
+5. **Add frontend polling cancellation** — Use AbortController or cleanup function.
+6. **Coordinate backend port** — Add a startup script or `.env` that ensures frontend proxy and backend use the same port.
+
+---
 
 ## Test Results
 
 ```
-> python -m pytest tests/ -v --tb=short
-119 passed in 4.78s ✓
+$ python -m pytest tests\ --tb=short -q
+283 passed, 1 warning in 7.68s
 
-> All 43 source module imports: OK ✓
+$ python -m uvicorn src.api.main:app --host 127.0.0.1 --port 8099
+INFO: Application startup complete
+Cleaned up 14 orphaned upload file(s)
 
-> uvicorn src.api.main:app --host 127.0.0.1 --port 8000
-INFO: Application startup complete ✓
+$ # API endpoint tests (via httpx)
+GET  /                     → 307 redirect to /docs
+GET  /health               → 200 {"status":"ok","service":"tennis-vision"}
+GET  /jobs                 → 200 []
+GET  /status/bad-id        → 404 {"detail":"Job 'bad-id' not found."}
+GET  /results/bad-id       → 404 {"detail":"Job 'bad-id' not found."}
+POST /upload (text file)   → 400 "Unsupported file type '.txt'"
 
-> GET /health → 200 {"status":"ok","service":"tennis-vision"} ✓
-> POST /upload (invalid ext) → 400 "Unsupported file type '.txt'" ✓
-> GET /status/nonexistent → 404 "Job 'nonexistent123' not found" ✓
-> GET /results/nonexistent → 404 "Job 'nonexistent123' not found" ✓
-> GET /jobs → 200, 0 jobs ✓
-> OpenAPI routes: /health, /jobs, /results/{job_id}, /status/{job_id}, /upload ✓
+$ # Frontend
+next build: ✓ compiled in 1992ms, zero TS errors, 3 static pages
 
-> POST /upload (tests/fixtures/tennis_test.mp4)
-  → 200 {"job_id":"f167355a4676","status":"queued"} ✓
-  → Progress: 0.1% → 16.5% (ball_tracking on GPU) → 100% ✓
-  → Complete at 100% ✓
-
-> GET /results/f167355a4676
-  → Status: complete ✓
-  → FPS: 30.0, total_frames: 1801 ✓
-  → Ball positions: 1801 entries ✓
-  → Raw ball detections: 1134/1801 ✓
-  → Interpolated detections: 211 ✓
-  → Total detected: 1345/1801 (74.7%) ✓
-  → Court-mapped positions: 0 ✗ (court detection still fails)
-  → Court detection: FAILED (max 2/14 keypoints across 21 sampled frames) ✗
-  → Rallies: 1 (frames 2–1800, 59.9s, 125 shots) ✗
-  → Serve analysis: 0 serves (skipped, no homography) ✗
-  → Visualizations: ALL null (no court coords) ✗
-  → Pixel X range: 136.5–1876.5, Y range: 154.5–1054.5 ✓
-  → Output directory: exists but empty (no heatmap PNGs) ✗
-
-> Frontend build (npm run build)
-  → Compiled successfully in 1.7s ✓
-  → TypeScript clean ✓
-  → Static pages generated ✓
-
-> Edge cases:
-  → _interpolate_subtrack([(None,None)]*3) → [(None,None),(None,None),(None,None)] ✓ (no NaN)
-  → Empty/corrupt .mp4 → FileNotFoundError("Cannot open video") ✓
+$ # Result payload size test
+18,000-frame result (10-min video) → 2.1 MB JSON
 ```
-
-## Verdict Summary
-
-**All 10 code bugs/issues from the Sprint 11 feedback have been fixed.** The codebase is clean:
-- 119 tests pass
-- 43 modules import cleanly
-- API starts and all 5 endpoints respond correctly
-- Frontend builds with no TypeScript errors
-- Edge cases handled (empty video, corrupt file, all-None interpolation)
-- Pipeline test mocks match actual code (iter_frames)
-- Heatmap URL paths are correct (no double prefix)
-- Coordinate transforms in frontend are correct
-
-**Remaining concerns are fundamental limitations, not code bugs:**
-- Court detection model detects only 2/14 keypoints on this footage (camera angle/model limitation)
-- Rally detection produces 1 giant rally (needs parameter tuning or algorithmic improvement)
-- Frames loaded into memory (known limitation for MVP)
-
-These are product/algorithm improvements for the next sprint, not code defects.
-
-Verdict: CLEAN

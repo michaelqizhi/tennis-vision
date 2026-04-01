@@ -19,14 +19,15 @@ router = APIRouter()
 async def get_jobs() -> list[StatusResponse]:
     """Return all jobs with their current status."""
     jobs = list_jobs()
-    return [
-        StatusResponse(
-            job_id=job.job_id,
-            status=job.status,
-            progress=job.progress,
-            current_step=job.current_step,
-            steps=job.steps,
-            error=job.error,
-        )
-        for job in jobs
-    ]
+    responses = []
+    for job in jobs:
+        snap = job.snapshot()
+        responses.append(StatusResponse(
+            job_id=snap["job_id"],
+            status=snap["status"],
+            progress=snap["progress"],
+            current_step=snap["current_step"],
+            steps=snap["steps"],
+            error=snap["error"],
+        ))
+    return responses

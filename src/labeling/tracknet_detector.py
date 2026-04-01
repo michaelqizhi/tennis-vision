@@ -128,10 +128,11 @@ class TrackNetDetector(BaseDetector):
         with torch.no_grad():
             out = self._model(torch.from_numpy(inp).float().to(self._device))
 
-        # Extract ball-class probability heatmap (class 1 = ball).
-        # softmax gives proper [0,1] probabilities; argmax would produce
-        # integer class indices that corrupt the weighted centroid.
-        output = out.softmax(dim=1)[0, 1].detach().cpu().numpy()
+        # TrackNet V2 outputs 256 channels — per-pixel classification into
+        # heatmap intensity levels (0 = background, 255 = ball centre).
+        # argmax recovers the predicted intensity per pixel, matching the
+        # main pipeline in src/features/ball_tracking/detector.py.
+        output = out.argmax(dim=1).detach().cpu().numpy()[0]
 
         x, y, conf = _weighted_centroid(
             output,

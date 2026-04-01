@@ -42,7 +42,10 @@ def postprocess(feature_map: np.ndarray, width: int = 640, height: int = 360,
                 hough_param2: int = 2,
                 hough_min_radius: int = 2,
                 hough_max_radius: int = 7) -> tuple[float | None, float | None]:
-    """Extract ball (x, y) from a model output heatmap using HoughCircles.
+    """Extract ball (x, y) from a model output heatmap using weighted centroid.
+
+    Uses cv2.moments weighted centroid as the primary method for robustness
+    on courtside footage. Falls back to HoughCircles if moments fail.
 
     Args:
         feature_map: Raw model output, shape (height*width,) or (height, width).
@@ -65,6 +68,17 @@ def postprocess(feature_map: np.ndarray, width: int = 640, height: int = 360,
         feature_map = feature_map.reshape((height, width))
 
     _, heatmap = cv2.threshold(feature_map, threshold, 255, cv2.THRESH_BINARY)
+
+    # Primary: weighted centroid via cv2.moments
+    moments = cv2.moments(heatmap)
+    if moments["m00"] > 0:
+        cx = moments["m10"] / moments["m00"]
+        cy = moments["m01"] / moments["m00"]
+        x = float(cx * scale_x)
+        y = float(cy * scale_y)
+        return x, y
+
+    # Fallback: HoughCircles
     circles = cv2.HoughCircles(
         heatmap, cv2.HOUGH_GRADIENT, dp=1, minDist=hough_min_dist,
         param1=hough_param1, param2=hough_param2,
@@ -305,7 +319,12 @@ class BallTracker:
         ball_track: list[tuple[float | None, float | None]],
         dists: list[float],
     ) -> list[tuple[float | None, float | None]]:
-        """Remove outlier detections based on distance between consecutive points."""
+        """Remove outlier detections based on distance between consecutive points.
+
+        Also rejects stationary detections: if the ball stays within a small
+        radius for too many consecutive frames, those are likely false positives
+        on players or static objects.
+        """
         max_dist = self.config.ball_tracking.max_outlier_dist
         outliers = list(np.where(np.array(dists) > max_dist)[0])
         for i in outliers:
@@ -314,7 +333,63 @@ class BallTracker:
                     ball_track[i] = (None, None)
                 elif i > 0 and dists[i - 1] == -1:
                     ball_track[i - 1] = (None, None)
+
+        # Remove stationary clusters (likely player/static object FPs)
+        ball_track = self._remove_stationary(ball_track)
+
         return ball_track
+
+    @staticmethod
+    def _remove_stationary(
+        ball_track: list[tuple[float | None, float | None]],
+        max_stationary_frames: int = 10,
+        stationary_radius: float = 15.0,
+    ) -> list[tuple[float | None, float | None]]:
+        """Remove detections that remain stationary for too many frames.
+
+        A tennis ball in play moves rapidly. Detections that cluster in a
+        small area for >max_stationary_frames are almost certainly false
+        positives on players, net posts, or static background features.
+
+        Args:
+            ball_track: Ball position track.
+            max_stationary_frames: Max consecutive frames allowed at same spot.
+            stationary_radius: Pixel radius to consider as "same position".
+
+        Returns:
+            Cleaned ball track with stationary clusters removed.
+        """
+        if len(ball_track) < max_stationary_frames:
+            return ball_track
+
+        result = list(ball_track)
+        i = 0
+        while i < len(result):
+            if result[i][0] is None:
+                i += 1
+                continue
+
+            # Find how many consecutive frames stay within stationary_radius
+            cluster_start = i
+            ref_x, ref_y = result[i]
+            j = i + 1
+            while j < len(result):
+                if result[j][0] is None:
+                    break
+                dx = result[j][0] - ref_x
+                dy = result[j][1] - ref_y
+                if (dx * dx + dy * dy) > stationary_radius * stationary_radius:
+                    break
+                j += 1
+
+            cluster_len = j - cluster_start
+            if cluster_len > max_stationary_frames:
+                for k in range(cluster_start, j):
+                    result[k] = (None, None)
+
+            i = j
+
+        return result
 
     def _interpolate_track(
         self,

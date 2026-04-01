@@ -167,7 +167,8 @@ class TestUploadRoute:
     def test_upload_valid_video(self, mock_submit):
         """Upload a valid .mp4 file should return 200 with job_id."""
         mock_submit.return_value = None
-        video_content = b"\x00" * 1024  # dummy content
+        # Minimal valid MP4 header (ftyp box at offset 4)
+        video_content = b"\x00\x00\x00\x1c" + b"ftyp" + b"isom" + b"\x00" * 1008
         resp = client.post(
             "/upload",
             files={"file": ("test_video.mp4", io.BytesIO(video_content), "video/mp4")},
@@ -240,6 +241,7 @@ class TestResultsRoute:
         job = create_job("/tmp/test.mp4", "test.mp4")
         job.status = JobStatus.PROCESSING
         resp = client.get(f"/results/{job.job_id}")
+        assert resp.status_code == 202
         data = resp.json()
         assert data["status"] == "processing"
         assert "still processing" in data["error"]

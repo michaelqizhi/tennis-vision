@@ -6,12 +6,15 @@ Job state is stored in-memory (sufficient for single-process MVP).
 
 from __future__ import annotations
 
+import copy
 import logging
+import shutil
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable
 
 from src.api.schemas import JobStatus, PipelineStep, StepProgress
@@ -36,9 +39,39 @@ class Job:
     error: str | None = None
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     completed_at: datetime | None = None
+    _mutation_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def set_step(self, step: PipelineStep, status: JobStatus, message: str = "") -> None:
         """Update or add a step's progress."""
+        with self._mutation_lock:
+            for s in self.steps:
+                if s.step == step:
+                    s.status = status
+                    s.message = message
+                    return
+            self.steps.append(StepProgress(step=step, status=status, message=message))
+
+    def update_progress(self, step: PipelineStep, message: str = "") -> None:
+        """Mark a step as processing and update overall progress."""
+        with self._mutation_lock:
+            self.current_step = step.value
+            self._set_step_unlocked(step, JobStatus.PROCESSING, message)
+            all_steps = list(PipelineStep)
+            done = sum(
+                1 for s in self.steps if s.status == JobStatus.COMPLETE
+            )
+            self.progress = done / len(all_steps)
+
+    def complete_step(self, step: PipelineStep, message: str = "") -> None:
+        """Mark a step as complete."""
+        with self._mutation_lock:
+            self._set_step_unlocked(step, JobStatus.COMPLETE, message)
+            all_steps = list(PipelineStep)
+            done = sum(1 for s in self.steps if s.status == JobStatus.COMPLETE)
+            self.progress = done / len(all_steps)
+
+    def _set_step_unlocked(self, step: PipelineStep, status: JobStatus, message: str) -> None:
+        """Update or add a step (caller must hold _mutation_lock)."""
         for s in self.steps:
             if s.step == step:
                 s.status = status
@@ -46,23 +79,24 @@ class Job:
                 return
         self.steps.append(StepProgress(step=step, status=status, message=message))
 
-    def update_progress(self, step: PipelineStep, message: str = "") -> None:
-        """Mark a step as processing and update overall progress."""
-        self.current_step = step.value
-        self.set_step(step, JobStatus.PROCESSING, message)
-        # Compute progress from completed steps
-        all_steps = list(PipelineStep)
-        done = sum(
-            1 for s in self.steps if s.status == JobStatus.COMPLETE
-        )
-        self.progress = done / len(all_steps)
+    def snapshot(self) -> dict[str, Any]:
+        """Return a thread-safe snapshot of job state for API responses.
 
-    def complete_step(self, step: PipelineStep, message: str = "") -> None:
-        """Mark a step as complete."""
-        self.set_step(step, JobStatus.COMPLETE, message)
-        all_steps = list(PipelineStep)
-        done = sum(1 for s in self.steps if s.status == JobStatus.COMPLETE)
-        self.progress = done / len(all_steps)
+        Returns a deep copy of results to prevent callers from mutating
+        shared state through the returned reference.
+        """
+        with self._mutation_lock:
+            return {
+                "job_id": self.job_id,
+                "status": self.status,
+                "progress": self.progress,
+                "current_step": self.current_step,
+                "steps": list(self.steps),
+                "results": copy.deepcopy(self.results),
+                "error": self.error,
+                "created_at": self.created_at,
+                "completed_at": self.completed_at,
+            }
 
 
 # In-memory job store (thread-safe via GIL for simple dict ops)
@@ -89,16 +123,20 @@ def submit_job(job: Job, pipeline_fn: Callable[[Job], None]) -> None:
     """Submit a job to the thread pool for background processing."""
     def _run() -> None:
         try:
-            job.status = JobStatus.PROCESSING
+            with job._mutation_lock:
+                job.status = JobStatus.PROCESSING
             pipeline_fn(job)
-            job.status = JobStatus.COMPLETE
-            job.progress = 1.0
+            with job._mutation_lock:
+                job.status = JobStatus.COMPLETE
+                job.progress = 1.0
         except Exception as exc:
             logger.exception("Pipeline failed for job %s", job.job_id)
-            job.status = JobStatus.FAILED
-            job.error = str(exc)
+            with job._mutation_lock:
+                job.status = JobStatus.FAILED
+                job.error = str(exc)
         finally:
-            job.completed_at = datetime.now(timezone.utc)
+            with job._mutation_lock:
+                job.completed_at = datetime.now(timezone.utc)
 
     _executor.submit(_run)
 
@@ -110,7 +148,12 @@ def list_jobs() -> list[Job]:
 
 
 def clear_completed_jobs() -> int:
-    """Remove completed/failed jobs from memory. Returns count removed."""
+    """Remove completed/failed jobs from memory and clean up output directories.
+
+    Returns count removed.
+    """
+    from src.config import load_config
+
     with _lock:
         to_remove = [
             jid for jid, j in _jobs.items()
@@ -118,4 +161,17 @@ def clear_completed_jobs() -> int:
         ]
         for jid in to_remove:
             del _jobs[jid]
-        return len(to_remove)
+
+    # Clean up output directories on disk
+    if to_remove:
+        try:
+            cfg = load_config()
+            for jid in to_remove:
+                job_dir = cfg.output_dir / jid
+                if job_dir.is_dir():
+                    shutil.rmtree(job_dir, ignore_errors=True)
+                    logger.info("Removed output directory: %s", job_dir)
+        except Exception:
+            logger.warning("Failed to clean up some output directories")
+
+    return len(to_remove)
