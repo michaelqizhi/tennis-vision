@@ -5,12 +5,16 @@
 # device: cuda  # "cuda" or "cpu" — auto-detected if omitted
 
 model:
-  tracknet_version: v2       # "v2" or "v4" (v5 planned — see ROADMAP.md)
+  tracknet_version: v2       # "v2", "v3", or "v4" (v5 planned — see ROADMAP.md)
   # TrackNet V2 settings
   tracknet_weights: weights/tracknet.pt
   tracknet_input_width: 640
   tracknet_input_height: 360
   tracknet_out_channels: 256
+  # TrackNet V3 settings (auto-downloads weights on first use)
+  tracknet_v3_weights: weights/tracknet_v3.pt
+  tracknet_v3_input_width: 512
+  tracknet_v3_input_height: 288
   # TrackNet V4 settings (auto-downloads weights on first use)
   tracknet_v4_weights: weights/tracknet_v4.pth
   tracknet_v4_input_width: 512
@@ -28,6 +32,7 @@ video:
 
 ball_tracking:
   confidence_threshold: 127
+  v3_detection_threshold: 0.5
   v4_detection_threshold: 0.5
   max_outlier_dist: 100.0
   max_gap: 4

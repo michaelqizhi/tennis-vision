@@ -11,14 +11,18 @@ import yaml
 @dataclass
 class ModelConfig:
     """Configuration for ML model inference."""
-    # Which TrackNet version to use: "v2" or "v4" (v5 planned)
+    # Which TrackNet version to use: "v2", "v3", or "v4" (v5 planned)
     tracknet_version: str = "v2"
     # TrackNet V2 settings
     tracknet_weights: str = "weights/tracknet.pt"
     tracknet_input_width: int = 640
     tracknet_input_height: int = 360
     tracknet_out_channels: int = 256
-    # TrackNet V4 settings
+    # TrackNet V3 settings (auto-downloads weights on first use)
+    tracknet_v3_weights: str = "weights/tracknet_v3.pt"
+    tracknet_v3_input_width: int = 512
+    tracknet_v3_input_height: int = 288
+    # TrackNet V4 settings (auto-downloads weights on first use)
     tracknet_v4_weights: str = "weights/tracknet_v4.pth"
     tracknet_v4_input_width: int = 512
     tracknet_v4_input_height: int = 288
@@ -41,6 +45,8 @@ class VideoConfig:
 class BallTrackingConfig:
     """Configuration for ball tracking postprocessing."""
     confidence_threshold: int = 127
+    # V3 detection threshold (sigmoid output, range 0-1)
+    v3_detection_threshold: float = 0.5
     # V4 detection threshold (sigmoid output, range 0-1)
     v4_detection_threshold: float = 0.5
     # Outlier removal
