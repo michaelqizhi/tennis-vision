@@ -33,12 +33,8 @@ _INPUT_W = 512
 _INPUT_H = 288
 _DETECTION_THRESHOLD = 0.5
 
-# Post-processing tuning for false-positive reduction.
-# V4 was trained on badminton and produces diffuse activations on tennis
-# players.  A real tennis ball at 512×288 is ≤10 px; player blobs are
-# typically 20-60 px.  We keep only the smallest, sharpest component.
-_MAX_BLOB_AREA = 30   # reject blobs larger than a ball
-_MIN_PEAK = 0.55      # require confident activation within the component
+# Post-processing: match the reference implementation — threshold 0.5,
+# largest contour, no area cap or per-component peak filter.
 
 # Where to download / find weights
 _WEIGHTS_FILENAME = "tracknet_v4.pth"
@@ -240,72 +236,48 @@ class TrackNetV4Detector(BaseDetector):
         with torch.no_grad():
             out = self._model(torch.from_numpy(inp).to(self._device))
 
-        # Output shape: (1, 3, H, W) — use channel 2 (most recent frame)
-        heatmap = out[0, 2].cpu().numpy()
+        # Output shape: (1, 3, H, W) — use channel 1 (center frame with
+        # bidirectional temporal context, matching reference inference).
+        heatmap = out[0, 1].cpu().numpy()
 
-        # Threshold and find centroid of the sharpest component
-        x, y, conf = self._peak_component_centroid(heatmap, scale_x, scale_y)
+        # Threshold and find ball via largest contour
+        x, y, conf = self._largest_contour_centroid(heatmap, scale_x, scale_y)
         if x is None:
             return None
         return (x, y, conf)
 
     @staticmethod
-    def _peak_component_centroid(
+    def _largest_contour_centroid(
         heatmap: np.ndarray,
         scale_x: float,
         scale_y: float,
         threshold: float = _DETECTION_THRESHOLD,
     ) -> tuple[float | None, float | None, float]:
-        """Extract ball position using the smallest qualifying component.
+        """Extract ball position via the largest contour in the thresholded heatmap.
 
-        Instead of computing a centroid over ALL above-threshold pixels
-        (which drifts toward large diffuse player-region activations),
-        this method:
-        1. Finds connected components in the thresholded heatmap.
-        2. Rejects components larger than ``_MAX_BLOB_AREA`` (player blobs).
-        3. Rejects components whose peak activation < ``_MIN_PEAK``.
-        4. Among survivors, picks the **smallest** — a real tennis ball
-           produces a tiny, bright blob; player limbs are larger.
-        5. Returns the centroid of only that component.
+        Matches the reference implementation: binarize at *threshold*,
+        find contours, pick the largest, return its centroid.
         """
         peak = float(heatmap.max())
         if peak < threshold:
             return None, None, 0.0
 
         binary = (heatmap > threshold).astype(np.uint8) * 255
-        n_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary)
-
-        # Evaluate each component (skip label 0 = background)
-        best_cx: float | None = None
-        best_cy: float | None = None
-        best_area = _MAX_BLOB_AREA + 1  # start larger than any acceptable
-        best_peak = 0.0
-
-        for lbl in range(1, n_labels):
-            area = stats[lbl, cv2.CC_STAT_AREA]
-
-            if area > _MAX_BLOB_AREA:
-                continue
-
-            comp_mask = labels == lbl
-            comp_peak = float(heatmap[comp_mask].max())
-
-            if comp_peak < _MIN_PEAK:
-                continue
-
-            # Prefer the smallest qualifying component (most ball-like)
-            if area < best_area or (area == best_area and comp_peak > best_peak):
-                best_area = area
-                best_cx = centroids[lbl][0]
-                best_cy = centroids[lbl][1]
-                best_peak = comp_peak
-
-        if best_cx is None:
+        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
             return None, None, 0.0
 
-        x = float(best_cx * scale_x)
-        y = float(best_cy * scale_y)
-        return x, y, best_peak
+        largest = max(contours, key=cv2.contourArea)
+        M = cv2.moments(largest)
+        if M["m00"] == 0:
+            return None, None, 0.0
+
+        cx = M["m10"] / M["m00"]
+        cy = M["m01"] / M["m00"]
+
+        x = float(cx * scale_x)
+        y = float(cy * scale_y)
+        return x, y, peak
 
     def unload(self) -> None:
         """Release model and clear frame buffer."""

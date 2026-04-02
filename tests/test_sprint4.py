@@ -389,8 +389,8 @@ class TestTrackNetV4Architecture:
         # With blank frames, likely None
         assert result is None or (isinstance(result, tuple) and len(result) == 3)
 
-    def test_peak_component_centroid(self):
-        """Peak-component centroid extracts position from heatmap."""
+    def test_largest_contour_centroid(self):
+        """Largest-contour centroid extracts position from heatmap."""
         from src.labeling.tracknetv4_detector import TrackNetV4Detector
 
         # Create a heatmap with a bright spot at (100, 50) in 512x288
@@ -399,7 +399,7 @@ class TestTrackNetV4Architecture:
         heatmap[51, 100] = 0.8
         heatmap[50, 101] = 0.8
 
-        x, y, conf = TrackNetV4Detector._peak_component_centroid(heatmap, scale_x=2.0, scale_y=2.0)
+        x, y, conf = TrackNetV4Detector._largest_contour_centroid(heatmap, scale_x=2.0, scale_y=2.0)
         assert x is not None
         assert y is not None
         assert conf >= 0.5
@@ -407,19 +407,19 @@ class TestTrackNetV4Architecture:
         assert abs(x - 200.0) < 10
         assert abs(y - 100.0) < 10
 
-    def test_peak_component_rejects_large_blob(self):
-        """Large diffuse blobs (player-sized) are rejected."""
-        from src.labeling.tracknetv4_detector import TrackNetV4Detector, _MAX_BLOB_AREA
+    def test_largest_contour_detects_large_blob(self):
+        """Large blobs are now detected (reference-style postprocessing)."""
+        from src.labeling.tracknetv4_detector import TrackNetV4Detector
 
-        # Create a heatmap with a large diffuse blob (40 pixels)
+        # Create a heatmap with a large diffuse blob (81 pixels)
         heatmap = np.zeros((288, 512), dtype=np.float32)
         for dy in range(-4, 5):
             for dx in range(-4, 5):
                 heatmap[140 + dy, 256 + dx] = 0.6
-        assert (heatmap > 0.5).sum() > _MAX_BLOB_AREA  # confirm it exceeds limit
+        assert (heatmap > 0.5).sum() > 30  # blob is larger than old limit
 
-        x, y, conf = TrackNetV4Detector._peak_component_centroid(heatmap, scale_x=2.0, scale_y=2.0)
-        assert x is None  # rejected as player-sized blob
+        x, y, conf = TrackNetV4Detector._largest_contour_centroid(heatmap, scale_x=2.0, scale_y=2.0)
+        assert x is not None  # now detected (not rejected)
 
 
 # ── Benchmark Report Tests ────────────────────────────────────────────

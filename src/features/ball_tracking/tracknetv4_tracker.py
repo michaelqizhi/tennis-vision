@@ -32,9 +32,9 @@ from src.models.tracknetv4 import TrackNetV4Model, load_tracknet_v4, INPUT_W, IN
 # V4 post-processing constants.
 # V4 outputs sigmoid [0, 1] heatmaps — these thresholds are calibrated for
 # that output space (vs V2's 256-class argmax → [0, 1] normalized heatmap).
+# Matches the reference implementation: threshold 0.5, largest contour, no
+# area or peak filtering (the model's sigmoid activations are already sparse).
 _DETECTION_THRESHOLD = 0.5
-_MAX_BLOB_AREA = 30  # reject blobs larger than a ball at 512×288
-_MIN_PEAK = 0.55     # require confident activation within a component
 
 
 def postprocess_v4(
@@ -45,9 +45,9 @@ def postprocess_v4(
 ) -> tuple[float | None, float | None, float]:
     """Extract ball (x, y, confidence) from a V4 sigmoid heatmap.
 
-    V4 outputs a [0, 1] sigmoid heatmap. Unlike V2's 256-class argmax output,
-    V4's heatmap has continuous activations. We use connected-component
-    analysis with size and peak filtering to reject player-region blobs.
+    V4 outputs a [0, 1] sigmoid heatmap. We binarize at the threshold and
+    pick the largest contour — matching the reference implementation which
+    uses no blob-area cap or per-component peak filter.
 
     Args:
         heatmap: Sigmoid heatmap, shape (H, W), values in [0, 1].
@@ -64,36 +64,21 @@ def postprocess_v4(
         return None, None, 0.0
 
     binary = (heatmap > threshold).astype(np.uint8) * 255
-    n_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary)
-
-    best_cx: float | None = None
-    best_cy: float | None = None
-    best_area = _MAX_BLOB_AREA + 1
-    best_peak = 0.0
-
-    for lbl in range(1, n_labels):
-        area = stats[lbl, cv2.CC_STAT_AREA]
-        if area > _MAX_BLOB_AREA:
-            continue
-
-        comp_mask = labels == lbl
-        comp_peak = float(heatmap[comp_mask].max())
-        if comp_peak < _MIN_PEAK:
-            continue
-
-        # Prefer the smallest qualifying component (most ball-like)
-        if area < best_area or (area == best_area and comp_peak > best_peak):
-            best_area = area
-            best_cx = centroids[lbl][0]
-            best_cy = centroids[lbl][1]
-            best_peak = comp_peak
-
-    if best_cx is None:
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
         return None, None, 0.0
 
-    x = float(best_cx * scale_x)
-    y = float(best_cy * scale_y)
-    return x, y, best_peak
+    # Pick the largest contour (matches reference postprocessing)
+    largest = max(contours, key=cv2.contourArea)
+    M = cv2.moments(largest)
+    if M["m00"] == 0:
+        return None, None, 0.0
+
+    cx = M["m10"] / M["m00"]
+    cy = M["m01"] / M["m00"]
+    x = float(cx * scale_x)
+    y = float(cy * scale_y)
+    return x, y, peak
 
 
 class BallTrackerV4:
@@ -172,8 +157,9 @@ class BallTrackerV4:
             with torch.no_grad():
                 out = model(torch.from_numpy(inp).float().to(cfg.device))
 
-            # V4 output: (1, 3, H, W) — channel 2 is the most recent frame
-            heatmap = out[0, 2].cpu().numpy()
+            # V4 output: (1, 3, H, W) — channel 1 is the center frame, which
+            # has bidirectional temporal context (matches reference inference).
+            heatmap = out[0, 1].cpu().numpy()
 
             x_pred, y_pred, conf = postprocess_v4(
                 heatmap, scale_x, scale_y,
@@ -276,7 +262,8 @@ class BallTrackerV4:
             with torch.no_grad():
                 out = model(torch.from_numpy(inp).float().to(cfg.device))
 
-            heatmap = out[0, 2].cpu().numpy()
+            # Channel 1 = center frame with bidirectional context
+            heatmap = out[0, 1].cpu().numpy()
 
             x_pred, y_pred, conf = postprocess_v4(
                 heatmap, scale_x, scale_y,
