@@ -29,7 +29,7 @@ INPUT_W = 512
 INPUT_H = 288
 
 # Google Drive file ID for reference checkpoint zip
-_GDRIVE_FILE_ID = "1CfzE87a0f6LhBp0kniSl-89zaLCZ8cA"
+_GDRIVE_FILE_ID = "1CfzE87a0f6LhBp0kniSl1-89zaLCZ8cA"
 _GDRIVE_URL = (
     f"https://drive.google.com/file/d/{_GDRIVE_FILE_ID}/view?usp=sharing"
 )

@@ -47,6 +47,8 @@ class BallTrackingConfig:
     confidence_threshold: int = 127
     # V3 detection threshold (sigmoid output, range 0-1)
     v3_detection_threshold: float = 0.5
+    # V3 background estimation: number of frames to sample for median
+    v3_bg_sample_count: int = 100
     # V4 detection threshold (sigmoid output, range 0-1)
     v4_detection_threshold: float = 0.5
     # Outlier removal

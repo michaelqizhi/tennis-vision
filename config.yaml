@@ -33,6 +33,7 @@ video:
 ball_tracking:
   confidence_threshold: 127
   v3_detection_threshold: 0.5
+  v3_bg_sample_count: 100
   v4_detection_threshold: 0.5
   max_outlier_dist: 100.0
   max_gap: 4

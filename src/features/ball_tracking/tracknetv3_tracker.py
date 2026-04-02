@@ -1,10 +1,11 @@
 """Ball tracking detector — runs TrackNet V3 inference on video frames.
 
-TrackNet V3 uses a U-Net with skip connections. Key differences from V2:
-  - Input resolution: 512×288 (vs 640×360 for V2)
-  - Output: 3-channel sigmoid heatmap (one per input frame)
-  - U-Net skip connections improve spatial precision
-  - Conv → BN → ReLU order with no bias
+TrackNet V3 uses a U-Net with skip connections. This checkpoint uses:
+  - ``seq_len=8``, ``bg_mode=concat``
+  - Input: 27 channels [background_RGB(3) + 8_frames_RGB(24)] at 512×288
+  - Output: 8-channel sigmoid heatmap (one per input frame)
+  - Non-overlapping 8-frame sliding windows
+  - Median background image estimated from sampled video frames
 
 This module provides ``BallTrackerV3`` which mirrors the V2 ``BallTracker``
 and V4 ``BallTrackerV4`` APIs but uses the V3 architecture.
@@ -12,7 +13,6 @@ and V4 ``BallTrackerV4`` APIs but uses the V3 architecture.
 
 from __future__ import annotations
 
-from collections import deque
 from itertools import groupby
 from typing import Callable, Iterator
 
@@ -27,12 +27,17 @@ from src.features.ball_tracking.detector import BallDetection
 from src.features.ball_tracking.tracknetv4_tracker import postprocess_v4
 from src.models.tracknetv3 import TrackNetV3Model, load_tracknet_v3, INPUT_W, INPUT_H
 
+_SEQ_LEN = 8
+
 
 class BallTrackerV3:
     """Track tennis ball positions across video frames using TrackNet V3.
 
     Drop-in replacement for BallTracker (V2) / BallTrackerV4 (V4) with the
     V3 U-Net architecture.  Returns the same ``BallDetection`` dataclass.
+
+    The V3 checkpoint uses an 8-frame window with a concatenated background
+    median image (``bg_mode=concat``), giving 27 input channels.
 
     Args:
         config: Project configuration. Uses default if not provided.
@@ -50,6 +55,135 @@ class BallTrackerV3:
                 str(weights), self.config.device, auto_download=True,
             )
         return self._model
+
+    # ── Background estimation ──
+
+    @staticmethod
+    def _estimate_background(
+        frames: list[np.ndarray],
+        sample_count: int = 100,
+    ) -> np.ndarray:
+        """Compute a median background image from a list of RGB 512×288 frames.
+
+        Args:
+            frames: Pre-processed frames (RGB, already resized to 512×288).
+            sample_count: Max number of frames to sample for the median.  If
+                the video has fewer frames than this, all frames are used.
+
+        Returns:
+            Median background as a uint8 ndarray of shape (288, 512, 3).
+        """
+        n = len(frames)
+        if n <= sample_count:
+            selected = frames
+        else:
+            indices = np.linspace(0, n - 1, sample_count, dtype=int)
+            selected = [frames[i] for i in indices]
+
+        stacked = np.stack(selected, axis=0)  # (N, H, W, 3)
+        median_bg = np.median(stacked, axis=0).astype(np.uint8)
+        return median_bg
+
+    # ── Input construction ──
+
+    @staticmethod
+    def _build_input(
+        bg: np.ndarray,
+        window_frames: list[np.ndarray],
+    ) -> np.ndarray:
+        """Build a (27, H, W) input tensor for one 8-frame window.
+
+        Channel layout: [bg_R, bg_G, bg_B, f1_R, f1_G, f1_B, ..., f8_R, f8_G, f8_B]
+
+        Args:
+            bg: Background median image (H, W, 3), uint8 RGB.
+            window_frames: List of 8 frames (H, W, 3), uint8 RGB.
+
+        Returns:
+            Float32 array of shape (27, H, W) normalised to [0, 1].
+        """
+        # Concatenate bg + 8 frames along channel axis → (H, W, 27)
+        imgs = np.concatenate([bg] + window_frames, axis=2)
+        imgs = imgs.astype(np.float32) / 255.0
+        imgs = np.rollaxis(imgs, 2, 0)  # (27, H, W)
+        return imgs
+
+    # ── Inference helpers ──
+
+    def _run_windows(
+        self,
+        rgb_frames: list[np.ndarray],
+        bg: np.ndarray,
+        scale_x: float,
+        scale_y: float,
+        progress_callback: Callable[[int, int], None] | None = None,
+    ) -> tuple[
+        list[tuple[float | None, float | None]],
+        list[float],
+        list[float],
+    ]:
+        """Process all frames through non-overlapping 8-frame windows.
+
+        Returns ball_track, confidences, and consecutive-distance lists (one
+        entry per frame).
+        """
+        model = self._ensure_model()
+        cfg = self.config
+        n = len(rgb_frames)
+        threshold = cfg.ball_tracking.v3_detection_threshold
+
+        ball_track: list[tuple[float | None, float | None]] = [(None, None)] * n
+        confidences: list[float] = [0.0] * n
+        dists: list[float] = [-1.0] * n
+
+        num_windows = (n + _SEQ_LEN - 1) // _SEQ_LEN
+        frames_processed = 0
+
+        for w in tqdm(range(num_windows), desc="Ball tracking (V3)"):
+            start = w * _SEQ_LEN
+            end = min(start + _SEQ_LEN, n)
+            window = list(rgb_frames[start:end])
+
+            # Pad with the last frame if the window is incomplete
+            valid_count = len(window)
+            while len(window) < _SEQ_LEN:
+                window.append(window[-1])
+
+            inp = self._build_input(bg, window)
+            inp_batch = np.expand_dims(inp, axis=0)  # (1, 27, H, W)
+
+            with torch.no_grad():
+                out = model(
+                    torch.from_numpy(inp_batch).float().to(cfg.device),
+                )  # (1, 8, H, W)
+
+            out_np = out[0].cpu().numpy()  # (8, H, W)
+
+            for f in range(valid_count):
+                abs_idx = start + f
+                heatmap = out_np[f]
+                x_pred, y_pred, conf = postprocess_v4(
+                    heatmap, scale_x, scale_y, threshold=threshold,
+                )
+                ball_track[abs_idx] = (x_pred, y_pred)
+                confidences[abs_idx] = conf
+
+                if (
+                    abs_idx > 0
+                    and ball_track[abs_idx][0] is not None
+                    and ball_track[abs_idx - 1][0] is not None
+                ):
+                    dists[abs_idx] = distance.euclidean(
+                        ball_track[abs_idx], ball_track[abs_idx - 1],
+                    )
+
+            frames_processed += valid_count
+            if progress_callback is not None:
+                progress_callback(frames_processed, n)
+
+        return ball_track, confidences, dists
+
+    # ── Public API ──
 
     def detect(
         self,
@@ -70,12 +204,6 @@ class BallTrackerV3:
         if not frames:
             return []
 
-        if len(frames) < 3:
-            return [
-                BallDetection(frame_number=i, x=None, y=None, confidence=0.0)
-                for i in range(len(frames))
-            ]
-
         model = self._ensure_model()
         cfg = self.config
         inp_w = cfg.model.tracknet_v3_input_width
@@ -85,55 +213,28 @@ class BallTrackerV3:
         scale_x = orig_w / inp_w
         scale_y = orig_h / inp_h
 
-        # First two frames have no detection (need 3-frame input)
-        ball_track: list[tuple[float | None, float | None]] = [(None, None)] * 2
-        confidences: list[float] = [0.0, 0.0]
-        dists: list[float] = [-1.0, -1.0]
+        # Pre-process: resize + BGR→RGB for all frames
+        rgb_frames = [
+            cv2.cvtColor(cv2.resize(f, (inp_w, inp_h)), cv2.COLOR_BGR2RGB)
+            for f in frames
+        ]
 
-        for num in tqdm(range(2, len(frames)), desc="Ball tracking (V3)"):
-            # V3 uses RGB color space, chronological frame order [oldest, middle, newest]
-            img = cv2.cvtColor(cv2.resize(frames[num], (inp_w, inp_h)), cv2.COLOR_BGR2RGB)
-            img_prev = cv2.cvtColor(cv2.resize(frames[num - 1], (inp_w, inp_h)), cv2.COLOR_BGR2RGB)
-            img_preprev = cv2.cvtColor(cv2.resize(frames[num - 2], (inp_w, inp_h)), cv2.COLOR_BGR2RGB)
+        # Background estimation
+        sample_count = cfg.ball_tracking.v3_bg_sample_count
+        bg = self._estimate_background(rgb_frames, sample_count)
 
-            # Stack 3 frames chronologically [oldest, middle, newest] → (H, W, 9)
-            imgs = np.concatenate((img_preprev, img_prev, img), axis=2)
-            imgs = imgs.astype(np.float32) / 255.0
-            imgs = np.rollaxis(imgs, 2, 0)  # (9, H, W)
-            inp = np.expand_dims(imgs, axis=0)
+        # Run inference in 8-frame windows
+        ball_track, confidences, dists = self._run_windows(
+            rgb_frames, bg, scale_x, scale_y, progress_callback,
+        )
 
-            with torch.no_grad():
-                out = model(torch.from_numpy(inp).float().to(cfg.device))
-
-            # V3 output: (1, 3, H, W) — channel 2 is the most recent frame
-            heatmap = out[0, -1].cpu().numpy()
-
-            x_pred, y_pred, conf = postprocess_v4(
-                heatmap, scale_x, scale_y,
-                threshold=cfg.ball_tracking.v3_detection_threshold,
-            )
-            ball_track.append((x_pred, y_pred))
-            confidences.append(conf)
-
-            if ball_track[-1][0] is not None and ball_track[-2][0] is not None:
-                dist = distance.euclidean(ball_track[-1], ball_track[-2])
-            else:
-                dist = -1.0
-            dists.append(dist)
-
-            if progress_callback is not None:
-                progress_callback(num - 1, len(frames) - 2)
-
-        # Remove outliers
+        # Post-processing
         ball_track = self._remove_outliers(ball_track, dists)
-
-        # Save raw track before interpolation
         raw_track = list(ball_track)
 
         if interpolate:
             ball_track = self._interpolate_track(ball_track)
 
-        # Convert to BallDetection list
         detections: list[BallDetection] = []
         for i, (x, y) in enumerate(ball_track):
             was_raw = raw_track[i][0] is not None
@@ -153,10 +254,11 @@ class BallTrackerV3:
         interpolate: bool = True,
         progress_callback: Callable[[int, int], None] | None = None,
     ) -> list[BallDetection]:
-        """Run ball detection by streaming frames through a sliding window.
+        """Run ball detection by streaming frames from an iterator.
 
-        Memory-efficient alternative to detect(): keeps at most 3 frames
-        in memory at a time.
+        V3 requires background estimation and arbitrary window access, so all
+        frames are collected first (stored as resized 512×288 RGB to save
+        memory).  Processing then proceeds identically to :meth:`detect`.
 
         Args:
             frame_iter: Iterator yielding BGR frames (original resolution).
@@ -172,72 +274,35 @@ class BallTrackerV3:
         inp_w = cfg.model.tracknet_v3_input_width
         inp_h = cfg.model.tracknet_v3_input_height
 
-        window: deque[np.ndarray] = deque(maxlen=3)
         scale_x: float | None = None
         scale_y: float | None = None
-        actual_count = 0
-
-        ball_track: list[tuple[float | None, float | None]] = []
-        confidences: list[float] = []
-        dists: list[float] = []
+        rgb_frames: list[np.ndarray] = []
 
         for frame in frame_iter:
-            actual_count += 1
-            window.append(frame)
-
             if scale_x is None:
                 orig_h, orig_w = frame.shape[:2]
                 scale_x = orig_w / inp_w
                 scale_y = orig_h / inp_h
-
-            if len(window) < 3:
-                ball_track.append((None, None))
-                confidences.append(0.0)
-                dists.append(-1.0)
-                continue
-
-            # V3: RGB, chronological [oldest, middle, newest]
-            img = cv2.cvtColor(cv2.resize(window[2], (inp_w, inp_h)), cv2.COLOR_BGR2RGB)
-            img_prev = cv2.cvtColor(cv2.resize(window[1], (inp_w, inp_h)), cv2.COLOR_BGR2RGB)
-            img_preprev = cv2.cvtColor(cv2.resize(window[0], (inp_w, inp_h)), cv2.COLOR_BGR2RGB)
-
-            # Stack chronologically [oldest, middle, newest]
-            imgs = np.concatenate((img_preprev, img_prev, img), axis=2)
-            imgs = imgs.astype(np.float32) / 255.0
-            imgs = np.rollaxis(imgs, 2, 0)
-            inp = np.expand_dims(imgs, axis=0)
-
-            with torch.no_grad():
-                out = model(torch.from_numpy(inp).float().to(cfg.device))
-
-            heatmap = out[0, -1].cpu().numpy()
-
-            x_pred, y_pred, conf = postprocess_v4(
-                heatmap, scale_x, scale_y,
-                threshold=cfg.ball_tracking.v3_detection_threshold,
+            rgb_frames.append(
+                cv2.cvtColor(cv2.resize(frame, (inp_w, inp_h)), cv2.COLOR_BGR2RGB),
             )
-            ball_track.append((x_pred, y_pred))
-            confidences.append(conf)
 
-            if ball_track[-1][0] is not None and ball_track[-2][0] is not None:
-                dist = distance.euclidean(ball_track[-1], ball_track[-2])
-            else:
-                dist = -1.0
-            dists.append(dist)
-
-            if progress_callback is not None:
-                progress_callback(actual_count - 2, max(1, total_frames - 2))
-
-        if actual_count == 0:
+        if not rgb_frames:
             return []
-        if actual_count < 3:
-            return [
-                BallDetection(frame_number=i, x=None, y=None, confidence=0.0)
-                for i in range(actual_count)
-            ]
 
+        # Background estimation
+        sample_count = cfg.ball_tracking.v3_bg_sample_count
+        bg = self._estimate_background(rgb_frames, sample_count)
+
+        # Run inference in 8-frame windows
+        ball_track, confidences, dists = self._run_windows(
+            rgb_frames, bg, scale_x, scale_y, progress_callback,
+        )
+
+        # Post-processing
         ball_track = self._remove_outliers(ball_track, dists)
         raw_track = list(ball_track)
+
         if interpolate:
             ball_track = self._interpolate_track(ball_track)
 

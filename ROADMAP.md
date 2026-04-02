@@ -149,6 +149,60 @@ Metrics are organized in **three layers** — improvements must be measured at a
 - ❌ <30% detection rate → check recording compliance first. If compliant, domain gap is too severe for pretrained V5 — trigger Phase 2A fine-tuning early.
 - ❌ <10% detection rate on non-compliant video → expected. Re-record with proper setup before proceeding.
 
+#### Week 1 Results (2026-04-02)
+
+**V5 status:** Unavailable. No public weights or permissive license exist. The V5 SDK repo (`codelancera-offical/TrackNetV5-SDK`) has architecture code but empty `weights/` directory. Falling back to V2/V3/V4.
+
+**Test set:** 6000 frames (3.3 min at 30fps) of real courtside amateur match video, 3883 annotated frames across 14 rallies. Human-annotated in CVAT with visibility attributes.
+
+**Baseline comparison (all pretrained, no fine-tuning):**
+
+| Metric | V2 (tennis) | V3 (badminton) | V4 (badminton) |
+|--------|-------------|----------------|----------------|
+| Raw detection rate | 62.9% | **55.5%** | 53.5% |
+| After interpolation | **73.8%** | 61.4% | 64.5% |
+| Precision | 0.42 | **0.43** | 0.28 |
+| Recall | **0.47** | 0.39 | 0.27 |
+| F1 | 0.44 | **0.41** | 0.28 |
+| Mean error (px) | **3.02** | 4.67 | 7.46 |
+| Breaks/min | 83 | **64** | 126 |
+| Physical consistency | 0.79 | **0.82** | 0.74 |
+| Rally recall | **28.6%** | 14.3% | 7.1% |
+| Rally FP rate | **96.6%** | 98.5% | 99.4% |
+| Inference speed | 14 fps | **78 fps** | 22 fps |
+
+**Key findings:**
+
+1. **V3 has the best trajectory continuity** (64 breaks/min vs 83 for V2) and highest precision (0.43) despite being trained on badminton. Its 8-frame window + background concat provides strong temporal context. Its 78 fps inference speed (non-overlapping stride-8 windows) is also the fastest.
+
+2. **V2 has the best raw recall** (47%) because it was trained on tennis data. But its trajectory is more fragmented than V3.
+
+3. **V4 had catastrophic postprocessing bugs** that were found and fixed: (a) selected smallest blob instead of largest, (b) rejected blobs >30px area when real blobs were 31-53px, (c) used output channel 2 instead of channel 1 (center frame with bidirectional context). After fixes: detection rate jumped from 20.9% → 53.5%, but still worst overall due to badminton-only weights with no skip connections.
+
+4. **V4 also had BGR→RGB and frame order bugs** found and fixed in earlier investigation round.
+
+5. **All rally detection is poor** (best: 28.6% recall, 96.6% FP rate). This is expected — raw detections without trajectory smoothing produce hyper-fragmented predicted rallies. Week 2's trajectory layer is critical.
+
+**Available training data for fine-tuning:**
+
+| Dataset | Frames | Sport | Access |
+|---------|--------|-------|--------|
+| TrackNet Original (Huang et al.) | ~21K | Tennis | Free (Google Drive) |
+| CoachAI Badminton | ~78K | Badminton | Free (SharePoint) |
+| TrackNet V3 raw_data | Varies | Tennis | In GitHub repo |
+| TrackNet V4 multiball | Unknown | Tennis+Badminton | Request form |
+| Our annotations | 3,883 | Tennis (courtside) | Local |
+
+**Go/No-Go assessment:**
+- ✅ Pipeline runs end-to-end without crashing
+- ✅ Best model detects ball in ≥30% of frames (V2: 62.9%, V3: 55.5%)
+- ✅ Three-layer scoring harness outputs metrics automatically
+- ✅ HoughCircles replaced with weighted centroid
+- ⚠️ Rally detection broken — needs Week 2 trajectory layer
+- ⚠️ V5 unavailable — V3 is the most promising architecture for fine-tuning (best trajectory continuity, fastest inference, U-Net with skip connections)
+
+**Recommendation:** Fine-tune V3 on tennis data (download free 21K-frame TrackNet dataset + our 3,883 frames). V3's architecture (U-Net + skip connections + background concat) is superior to V2, and fine-tuning on tennis should close the precision gap. Proceed with Week 2 trajectory layer in parallel.
+
 ### Week 2: Court Detection + Trajectory Layer
 
 **Objective:** Significantly improve tracking quality via court geometry and trajectory-level processing.
