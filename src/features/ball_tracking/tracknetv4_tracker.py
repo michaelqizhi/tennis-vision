@@ -138,12 +138,15 @@ class BallTrackerV4:
         scale_x = orig_w / inp_w
         scale_y = orig_h / inp_h
 
-        # First two frames have no detection (need 3-frame input)
-        ball_track: list[tuple[float | None, float | None]] = [(None, None)] * 2
-        confidences: list[float] = [0.0, 0.0]
-        dists: list[float] = [-1.0, -1.0]
+        # Pre-allocate arrays for all frames.
+        # Channel 1 = center frame (num-1), so frames 0 and len-1 have no
+        # detection (they are never the center of a 3-frame window).
+        n_frames = len(frames)
+        ball_track: list[tuple[float | None, float | None]] = [(None, None)] * n_frames
+        confidences: list[float] = [0.0] * n_frames
+        dists: list[float] = [-1.0] * n_frames
 
-        for num in tqdm(range(2, len(frames)), desc="Ball tracking (V4)"):
+        for num in tqdm(range(2, n_frames), desc="Ball tracking (V4)"):
             img = cv2.cvtColor(cv2.resize(frames[num], (inp_w, inp_h)), cv2.COLOR_BGR2RGB)
             img_prev = cv2.cvtColor(cv2.resize(frames[num - 1], (inp_w, inp_h)), cv2.COLOR_BGR2RGB)
             img_preprev = cv2.cvtColor(cv2.resize(frames[num - 2], (inp_w, inp_h)), cv2.COLOR_BGR2RGB)
@@ -157,22 +160,30 @@ class BallTrackerV4:
             with torch.no_grad():
                 out = model(torch.from_numpy(inp).float().to(cfg.device))
 
-            # V4 output: (1, 3, H, W) — channel 1 is the center frame, which
-            # has bidirectional temporal context (matches reference inference).
+            # V4 output: (1, 3, H, W) — channel 1 is the center frame (num-1),
+            # which has bidirectional temporal context. Write the prediction to
+            # the correct frame index (num-1), not the current frame (num).
             heatmap = out[0, 1].cpu().numpy()
 
             x_pred, y_pred, conf = postprocess_v4(
                 heatmap, scale_x, scale_y,
                 threshold=cfg.ball_tracking.v4_detection_threshold,
             )
-            ball_track.append((x_pred, y_pred))
-            confidences.append(conf)
+            center_idx = num - 1
+            ball_track[center_idx] = (x_pred, y_pred)
+            confidences[center_idx] = conf
 
-            if ball_track[-1][0] is not None and ball_track[-2][0] is not None:
-                dist = distance.euclidean(ball_track[-1], ball_track[-2])
+            if (
+                ball_track[center_idx][0] is not None
+                and center_idx > 0
+                and ball_track[center_idx - 1][0] is not None
+            ):
+                dist = distance.euclidean(
+                    ball_track[center_idx], ball_track[center_idx - 1],
+                )
             else:
                 dist = -1.0
-            dists.append(dist)
+            dists[center_idx] = dist
 
             if progress_callback is not None:
                 progress_callback(num - 1, len(frames) - 2)
@@ -228,14 +239,17 @@ class BallTrackerV4:
         window: deque[np.ndarray] = deque(maxlen=3)
         scale_x: float | None = None
         scale_y: float | None = None
-        actual_count = 0
+        frame_idx = 0
 
-        ball_track: list[tuple[float | None, float | None]] = []
-        confidences: list[float] = []
-        dists: list[float] = []
+        # Pre-allocate arrays. Channel 1 = center frame, so we write to
+        # frame_idx - 1 once we have a full 3-frame window.
+        ball_track: list[tuple[float | None, float | None]] = [
+            (None, None)
+        ] * total_frames
+        confidences: list[float] = [0.0] * total_frames
+        dists: list[float] = [-1.0] * total_frames
 
         for frame in frame_iter:
-            actual_count += 1
             window.append(frame)
 
             if scale_x is None:
@@ -244,9 +258,7 @@ class BallTrackerV4:
                 scale_y = orig_h / inp_h
 
             if len(window) < 3:
-                ball_track.append((None, None))
-                confidences.append(0.0)
-                dists.append(-1.0)
+                frame_idx += 1
                 continue
 
             img = cv2.cvtColor(cv2.resize(window[2], (inp_w, inp_h)), cv2.COLOR_BGR2RGB)
@@ -262,24 +274,35 @@ class BallTrackerV4:
             with torch.no_grad():
                 out = model(torch.from_numpy(inp).float().to(cfg.device))
 
-            # Channel 1 = center frame with bidirectional context
+            # Channel 1 = center frame (frame_idx - 1) with bidirectional context
             heatmap = out[0, 1].cpu().numpy()
 
             x_pred, y_pred, conf = postprocess_v4(
                 heatmap, scale_x, scale_y,
                 threshold=cfg.ball_tracking.v4_detection_threshold,
             )
-            ball_track.append((x_pred, y_pred))
-            confidences.append(conf)
+            center_idx = frame_idx - 1
+            ball_track[center_idx] = (x_pred, y_pred)
+            confidences[center_idx] = conf
 
-            if ball_track[-1][0] is not None and ball_track[-2][0] is not None:
-                dist = distance.euclidean(ball_track[-1], ball_track[-2])
+            if (
+                center_idx > 0
+                and ball_track[center_idx][0] is not None
+                and ball_track[center_idx - 1][0] is not None
+            ):
+                dist = distance.euclidean(
+                    ball_track[center_idx], ball_track[center_idx - 1],
+                )
             else:
                 dist = -1.0
-            dists.append(dist)
+            dists[center_idx] = dist
 
             if progress_callback is not None:
-                progress_callback(actual_count - 2, max(1, total_frames - 2))
+                progress_callback(frame_idx - 1, max(1, total_frames - 2))
+
+            frame_idx += 1
+
+        actual_count = frame_idx
 
         if actual_count == 0:
             return []

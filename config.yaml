@@ -34,7 +34,7 @@ ball_tracking:
   confidence_threshold: 127
   v3_detection_threshold: 0.5
   v3_bg_sample_count: 100
-  v4_detection_threshold: 0.5
+  v4_detection_threshold: 0.55
   max_outlier_dist: 100.0
   max_gap: 4
   max_dist_gap: 80.0
@@ -47,3 +47,15 @@ court_detection:
   heatmap_threshold: 130
   refine_crop_size: 40
   min_keypoints: 4
+  # Court boundary filter
+  boundary_x_margin: 3.0
+  boundary_y_margin: 5.0
+  # Frame selector
+  min_court_color_score: 0.15
+  min_sharpness: 100.0
+  frame_sample_interval: 5.0
+  # Homography monitor
+  monitor_interval: 30
+  monitor_ncc_threshold: 0.65
+  monitor_consensus_ratio: 0.6
+  monitor_cooldown: 5
