@@ -225,9 +225,9 @@ class TrackNetV4Detector(BaseDetector):
         scale_x = orig_w / _INPUT_W
         scale_y = orig_h / _INPUT_H
 
-        # Resize frames to model input resolution
+        # Resize and convert BGR→RGB (model was trained on RGB)
         resized = [
-            cv2.resize(self._buffer[i], (_INPUT_W, _INPUT_H))
+            cv2.cvtColor(cv2.resize(self._buffer[i], (_INPUT_W, _INPUT_H)), cv2.COLOR_BGR2RGB)
             for i in range(3)
         ]
 

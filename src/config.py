@@ -11,14 +11,19 @@ import yaml
 @dataclass
 class ModelConfig:
     """Configuration for ML model inference."""
+    # Which TrackNet version to use: "v2" or "v4" (v5 planned)
+    tracknet_version: str = "v2"
+    # TrackNet V2 settings
     tracknet_weights: str = "weights/tracknet.pt"
-    court_weights: str = "weights/court_detector.pt"
-    # TrackNet inference resolution (must match training resolution)
     tracknet_input_width: int = 640
     tracknet_input_height: int = 360
-    # Number of output classes for TrackNet heatmap
     tracknet_out_channels: int = 256
-    # Court detector inference resolution
+    # TrackNet V4 settings
+    tracknet_v4_weights: str = "weights/tracknet_v4.pth"
+    tracknet_v4_input_width: int = 512
+    tracknet_v4_input_height: int = 288
+    # Court detector settings
+    court_weights: str = "weights/court_detector.pt"
     court_input_width: int = 640
     court_input_height: int = 360
     court_out_channels: int = 15
@@ -36,11 +41,8 @@ class VideoConfig:
 class BallTrackingConfig:
     """Configuration for ball tracking postprocessing."""
     confidence_threshold: int = 127
-    hough_min_dist: int = 1
-    hough_param1: int = 50
-    hough_param2: int = 2
-    hough_min_radius: int = 2
-    hough_max_radius: int = 7
+    # V4 detection threshold (sigmoid output, range 0-1)
+    v4_detection_threshold: float = 0.5
     # Outlier removal
     max_outlier_dist: float = 100.0
     # Interpolation
@@ -57,8 +59,6 @@ class BallTrackingConfig:
 class CourtDetectionConfig:
     """Configuration for court keypoint detection postprocessing."""
     heatmap_threshold: int = 130
-    min_radius: int = 8
-    max_radius: int = 35
     refine_crop_size: int = 40
     # Minimum keypoints for valid detection
     min_keypoints: int = 4
@@ -102,7 +102,7 @@ def load_config(config_path: str | None = None) -> Config:
     cfg = Config()
 
     if config_path and os.path.exists(config_path):
-        with open(config_path, "r") as f:
+        with open(config_path, "r", encoding="utf-8") as f:
             overrides = yaml.safe_load(f) or {}
 
         if "device" in overrides:
@@ -135,5 +135,6 @@ def get_config() -> Config:
     """Get the default project configuration (singleton)."""
     global _default_config
     if _default_config is None:
-        _default_config = load_config()
+        default_yaml = Path(__file__).resolve().parent.parent / "config.yaml"
+        _default_config = load_config(str(default_yaml) if default_yaml.exists() else None)
     return _default_config

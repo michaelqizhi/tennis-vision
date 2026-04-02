@@ -1,8 +1,20 @@
-"""Ball tracking detector — runs TrackNetV2 inference on video frames."""
+"""Ball tracking detector — runs TrackNet V4 inference on video frames.
+
+TrackNet V4 uses a motion-attention-enhanced U-Net. Key differences from V2:
+  - Input resolution: 512×288 (vs 640×360 for V2)
+  - Output: 3-channel sigmoid heatmap (one per input frame)
+  - Motion Prompt module extracts attention from frame differences
+  - Better handling of fast-moving objects via learnable motion attention
+
+This module provides ``BallTrackerV4`` which mirrors the V2 ``BallTracker``
+API but uses the V4 architecture and its own postprocessing tuned for the
+sigmoid output space.
+"""
+
+from __future__ import annotations
 
 import math
 from collections import deque
-from dataclasses import dataclass
 from itertools import groupby
 from typing import Callable, Iterator
 
@@ -13,77 +25,82 @@ from scipy.spatial import distance
 from tqdm import tqdm
 
 from src.config import Config, get_config
-from src.models.tracknet import BallTrackerNet, load_tracknet
+from src.features.ball_tracking.detector import BallDetection
+from src.models.tracknetv4 import TrackNetV4Model, load_tracknet_v4, INPUT_W, INPUT_H
 
 
-@dataclass
-class BallDetection:
-    """A single ball detection for one frame."""
-    frame_number: int
-    x: float | None
-    y: float | None
-    confidence: float
-    interpolated: bool = False
-
-    @property
-    def detected(self) -> bool:
-        if self.x is None or self.y is None:
-            return False
-        if math.isnan(self.x) or math.isnan(self.y):
-            return False
-        return True
+# V4 post-processing constants.
+# V4 outputs sigmoid [0, 1] heatmaps — these thresholds are calibrated for
+# that output space (vs V2's 256-class argmax → [0, 1] normalized heatmap).
+_DETECTION_THRESHOLD = 0.5
+_MAX_BLOB_AREA = 30  # reject blobs larger than a ball at 512×288
+_MIN_PEAK = 0.55     # require confident activation within a component
 
 
-def postprocess(feature_map: np.ndarray, width: int = 640, height: int = 360,
-                scale_x: float = 1.0, scale_y: float = 1.0,
-                threshold: int = 127) -> tuple[float | None, float | None]:
-    """Extract ball (x, y) from a model output heatmap via weighted centroid.
+def postprocess_v4(
+    heatmap: np.ndarray,
+    scale_x: float = 1.0,
+    scale_y: float = 1.0,
+    threshold: float = _DETECTION_THRESHOLD,
+) -> tuple[float | None, float | None, float]:
+    """Extract ball (x, y, confidence) from a V4 sigmoid heatmap.
 
-    Uses intensity-preserving threshold + connected components to find the
-    strongest blob, then computes weighted centroid with cv2.moments.
-    Handles elliptical blobs from oblique courtside angles.
+    V4 outputs a [0, 1] sigmoid heatmap. Unlike V2's 256-class argmax output,
+    V4's heatmap has continuous activations. We use connected-component
+    analysis with size and peak filtering to reject player-region blobs.
 
     Args:
-        feature_map: Raw model output, shape (height*width,) or (height, width).
-        width: Model input width.
-        height: Model input height.
+        heatmap: Sigmoid heatmap, shape (H, W), values in [0, 1].
         scale_x: Scale factor to map x back to original video resolution.
         scale_y: Scale factor to map y back to original video resolution.
-        threshold: Intensity threshold — pixels below this are zeroed out.
+        threshold: Activation threshold — pixels below this are ignored.
 
     Returns:
-        Tuple of (x, y) in original video coordinates, or (None, None).
+        Tuple of (x, y, confidence) in original video coordinates,
+        or (None, None, 0.0) if no ball detected.
     """
-    feature_map = (feature_map * 255).astype(np.uint8)
-    if feature_map.ndim == 1:
-        feature_map = feature_map.reshape((height, width))
+    peak = float(heatmap.max())
+    if peak < threshold:
+        return None, None, 0.0
 
-    # Keep original intensities above threshold (not binary)
-    _, heatmap = cv2.threshold(feature_map, threshold, 255, cv2.THRESH_TOZERO)
+    binary = (heatmap > threshold).astype(np.uint8) * 255
+    n_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary)
 
-    if heatmap.max() == 0:
-        return None, None
+    best_cx: float | None = None
+    best_cy: float | None = None
+    best_area = _MAX_BLOB_AREA + 1
+    best_peak = 0.0
 
-    # Isolate the strongest connected component by total intensity
-    num_labels, labels = cv2.connectedComponents((heatmap > 0).astype(np.uint8))
-    if num_labels <= 1:
-        return None, None
+    for lbl in range(1, n_labels):
+        area = stats[lbl, cv2.CC_STAT_AREA]
+        if area > _MAX_BLOB_AREA:
+            continue
 
-    best_label = max(range(1, num_labels), key=lambda l: heatmap[labels == l].sum())
-    masked = np.where(labels == best_label, heatmap, 0).astype(np.uint8)
+        comp_mask = labels == lbl
+        comp_peak = float(heatmap[comp_mask].max())
+        if comp_peak < _MIN_PEAK:
+            continue
 
-    # Weighted centroid — brighter pixels pull the center more
-    moments = cv2.moments(masked)
-    if moments["m00"] > 0:
-        cx = moments["m10"] / moments["m00"]
-        cy = moments["m01"] / moments["m00"]
-        return float(cx * scale_x), float(cy * scale_y)
+        # Prefer the smallest qualifying component (most ball-like)
+        if area < best_area or (area == best_area and comp_peak > best_peak):
+            best_area = area
+            best_cx = centroids[lbl][0]
+            best_cy = centroids[lbl][1]
+            best_peak = comp_peak
 
-    return None, None
+    if best_cx is None:
+        return None, None, 0.0
+
+    x = float(best_cx * scale_x)
+    y = float(best_cy * scale_y)
+    return x, y, best_peak
 
 
-class BallTracker:
-    """Track tennis ball positions across video frames using TrackNetV2.
+class BallTrackerV4:
+    """Track tennis ball positions across video frames using TrackNet V4.
+
+    Drop-in replacement for BallTracker (V2) with the V4 motion-attention
+    architecture. Returns the same ``BallDetection`` dataclass.
 
     Args:
         config: Project configuration. Uses default if not provided.
@@ -91,24 +108,29 @@ class BallTracker:
 
     def __init__(self, config: Config | None = None):
         self.config = config or get_config()
-        self._model: BallTrackerNet | None = None
+        self._model: TrackNetV4Model | None = None
 
-    def _ensure_model(self) -> BallTrackerNet:
-        """Lazily load the model."""
+    def _ensure_model(self) -> TrackNetV4Model:
+        """Lazily load the V4 model."""
         if self._model is None:
-            weights = self.config.resolve_path(self.config.model.tracknet_weights)
-            self._model = load_tracknet(str(weights), self.config.device)
+            weights = self.config.resolve_path(self.config.model.tracknet_v4_weights)
+            self._model = load_tracknet_v4(
+                str(weights), self.config.device, auto_download=True,
+            )
         return self._model
 
-    def detect(self, frames: list[np.ndarray],
-               interpolate: bool = True,
-               progress_callback: "Callable[[int, int], None] | None" = None) -> list[BallDetection]:
+    def detect(
+        self,
+        frames: list[np.ndarray],
+        interpolate: bool = True,
+        progress_callback: Callable[[int, int], None] | None = None,
+    ) -> list[BallDetection]:
         """Run ball detection on a list of video frames.
 
         Args:
             frames: List of BGR frames (original resolution).
             interpolate: Whether to interpolate gaps in the track.
-            progress_callback: Optional callback(current_frame, total_frames) for progress reporting.
+            progress_callback: Optional callback(current_frame, total_frames).
 
         Returns:
             List of BallDetection, one per frame.
@@ -124,8 +146,8 @@ class BallTracker:
 
         model = self._ensure_model()
         cfg = self.config
-        inp_w = cfg.model.tracknet_input_width
-        inp_h = cfg.model.tracknet_input_height
+        inp_w = cfg.model.tracknet_v4_input_width
+        inp_h = cfg.model.tracknet_v4_input_height
 
         orig_h, orig_w = frames[0].shape[:2]
         scale_x = orig_w / inp_w
@@ -133,29 +155,32 @@ class BallTracker:
 
         # First two frames have no detection (need 3-frame input)
         ball_track: list[tuple[float | None, float | None]] = [(None, None)] * 2
+        confidences: list[float] = [0.0, 0.0]
         dists: list[float] = [-1.0, -1.0]
 
-        for num in tqdm(range(2, len(frames)), desc="Ball tracking"):
-            img = cv2.resize(frames[num], (inp_w, inp_h))
-            img_prev = cv2.resize(frames[num - 1], (inp_w, inp_h))
-            img_preprev = cv2.resize(frames[num - 2], (inp_w, inp_h))
+        for num in tqdm(range(2, len(frames)), desc="Ball tracking (V4)"):
+            img = cv2.cvtColor(cv2.resize(frames[num], (inp_w, inp_h)), cv2.COLOR_BGR2RGB)
+            img_prev = cv2.cvtColor(cv2.resize(frames[num - 1], (inp_w, inp_h)), cv2.COLOR_BGR2RGB)
+            img_preprev = cv2.cvtColor(cv2.resize(frames[num - 2], (inp_w, inp_h)), cv2.COLOR_BGR2RGB)
 
-            # Stack 3 frames → (H, W, 9)
-            imgs = np.concatenate((img, img_prev, img_preprev), axis=2)
+            # Stack 3 frames chronologically [oldest, middle, newest] → (H, W, 9)
+            imgs = np.concatenate((img_preprev, img_prev, img), axis=2)
             imgs = imgs.astype(np.float32) / 255.0
-            # (9, H, W)
-            imgs = np.rollaxis(imgs, 2, 0)
+            imgs = np.rollaxis(imgs, 2, 0)  # (9, H, W)
             inp = np.expand_dims(imgs, axis=0)
 
             with torch.no_grad():
                 out = model(torch.from_numpy(inp).float().to(cfg.device))
 
-            output = out.argmax(dim=1).detach().cpu().numpy()
-            x_pred, y_pred = postprocess(
-                output[0], inp_w, inp_h, scale_x, scale_y,
-                threshold=cfg.ball_tracking.confidence_threshold,
+            # V4 output: (1, 3, H, W) — channel 2 is the most recent frame
+            heatmap = out[0, 2].cpu().numpy()
+
+            x_pred, y_pred, conf = postprocess_v4(
+                heatmap, scale_x, scale_y,
+                threshold=cfg.ball_tracking.v4_detection_threshold,
             )
             ball_track.append((x_pred, y_pred))
+            confidences.append(conf)
 
             if ball_track[-1][0] is not None and ball_track[-2][0] is not None:
                 dist = distance.euclidean(ball_track[-1], ball_track[-2])
@@ -169,10 +194,9 @@ class BallTracker:
         # Remove outliers
         ball_track = self._remove_outliers(ball_track, dists)
 
-        # Save raw (pre-interpolation) track to mark interpolated positions
+        # Save raw track before interpolation
         raw_track = list(ball_track)
 
-        # Interpolate gaps
         if interpolate:
             ball_track = self._interpolate_track(ball_track)
 
@@ -181,7 +205,7 @@ class BallTracker:
         for i, (x, y) in enumerate(ball_track):
             was_raw = raw_track[i][0] is not None
             is_interpolated = (x is not None) and not was_raw
-            conf = 1.0 if was_raw else (0.5 if is_interpolated else 0.0)
+            conf = confidences[i] if was_raw else (0.5 if is_interpolated else 0.0)
             detections.append(BallDetection(
                 frame_number=i, x=x, y=y, confidence=conf,
                 interpolated=is_interpolated,
@@ -199,7 +223,7 @@ class BallTracker:
         """Run ball detection by streaming frames through a sliding window.
 
         Memory-efficient alternative to detect(): keeps at most 3 frames
-        in memory at a time instead of loading the entire video.
+        in memory at a time.
 
         Args:
             frame_iter: Iterator yielding BGR frames (original resolution).
@@ -212,39 +236,39 @@ class BallTracker:
         """
         model = self._ensure_model()
         cfg = self.config
-        inp_w = cfg.model.tracknet_input_width
-        inp_h = cfg.model.tracknet_input_height
+        inp_w = cfg.model.tracknet_v4_input_width
+        inp_h = cfg.model.tracknet_v4_input_height
 
-        # Sliding window of the 3 most recent frames
         window: deque[np.ndarray] = deque(maxlen=3)
         scale_x: float | None = None
         scale_y: float | None = None
         actual_count = 0
 
         ball_track: list[tuple[float | None, float | None]] = []
+        confidences: list[float] = []
         dists: list[float] = []
 
         for frame in frame_iter:
             actual_count += 1
             window.append(frame)
 
-            # Determine scale factors from first frame
             if scale_x is None:
                 orig_h, orig_w = frame.shape[:2]
                 scale_x = orig_w / inp_w
                 scale_y = orig_h / inp_h
 
             if len(window) < 3:
-                # Need 3 frames before detection can start
                 ball_track.append((None, None))
+                confidences.append(0.0)
                 dists.append(-1.0)
                 continue
 
-            img = cv2.resize(window[2], (inp_w, inp_h))
-            img_prev = cv2.resize(window[1], (inp_w, inp_h))
-            img_preprev = cv2.resize(window[0], (inp_w, inp_h))
+            img = cv2.cvtColor(cv2.resize(window[2], (inp_w, inp_h)), cv2.COLOR_BGR2RGB)
+            img_prev = cv2.cvtColor(cv2.resize(window[1], (inp_w, inp_h)), cv2.COLOR_BGR2RGB)
+            img_preprev = cv2.cvtColor(cv2.resize(window[0], (inp_w, inp_h)), cv2.COLOR_BGR2RGB)
 
-            imgs = np.concatenate((img, img_prev, img_preprev), axis=2)
+            # Stack chronologically [oldest, middle, newest]
+            imgs = np.concatenate((img_preprev, img_prev, img), axis=2)
             imgs = imgs.astype(np.float32) / 255.0
             imgs = np.rollaxis(imgs, 2, 0)
             inp = np.expand_dims(imgs, axis=0)
@@ -252,12 +276,14 @@ class BallTracker:
             with torch.no_grad():
                 out = model(torch.from_numpy(inp).float().to(cfg.device))
 
-            output = out.argmax(dim=1).detach().cpu().numpy()
-            x_pred, y_pred = postprocess(
-                output[0], inp_w, inp_h, scale_x, scale_y,
-                threshold=cfg.ball_tracking.confidence_threshold,
+            heatmap = out[0, 2].cpu().numpy()
+
+            x_pred, y_pred, conf = postprocess_v4(
+                heatmap, scale_x, scale_y,
+                threshold=cfg.ball_tracking.v4_detection_threshold,
             )
             ball_track.append((x_pred, y_pred))
+            confidences.append(conf)
 
             if ball_track[-1][0] is not None and ball_track[-2][0] is not None:
                 dist = distance.euclidean(ball_track[-1], ball_track[-2])
@@ -276,7 +302,6 @@ class BallTracker:
                 for i in range(actual_count)
             ]
 
-        # Post-processing is identical to detect()
         ball_track = self._remove_outliers(ball_track, dists)
         raw_track = list(ball_track)
         if interpolate:
@@ -286,7 +311,7 @@ class BallTracker:
         for i, (x, y) in enumerate(ball_track):
             was_raw = raw_track[i][0] is not None
             is_interpolated = (x is not None) and not was_raw
-            conf = 1.0 if was_raw else (0.5 if is_interpolated else 0.0)
+            conf = confidences[i] if was_raw else (0.5 if is_interpolated else 0.0)
             detections.append(BallDetection(
                 frame_number=i, x=x, y=y, confidence=conf,
                 interpolated=is_interpolated,
@@ -294,17 +319,14 @@ class BallTracker:
 
         return detections
 
+    # ── Post-processing (shared with V2 BallTracker) ──
+
     def _remove_outliers(
         self,
         ball_track: list[tuple[float | None, float | None]],
         dists: list[float],
     ) -> list[tuple[float | None, float | None]]:
-        """Remove outlier detections based on distance between consecutive points.
-
-        Also rejects stationary detections: if the ball stays within a small
-        radius for too many consecutive frames, those are likely false positives
-        on players or static objects.
-        """
+        """Remove outlier detections based on distance between consecutive points."""
         max_dist = self.config.ball_tracking.max_outlier_dist
         outliers = list(np.where(np.array(dists) > max_dist)[0])
         for i in outliers:
@@ -314,9 +336,7 @@ class BallTracker:
                 elif i > 0 and dists[i - 1] == -1:
                     ball_track[i - 1] = (None, None)
 
-        # Remove stationary clusters (likely player/static object FPs)
         ball_track = self._remove_stationary(ball_track)
-
         return ball_track
 
     @staticmethod
@@ -325,20 +345,7 @@ class BallTracker:
         max_stationary_frames: int = 10,
         stationary_radius: float = 15.0,
     ) -> list[tuple[float | None, float | None]]:
-        """Remove detections that remain stationary for too many frames.
-
-        A tennis ball in play moves rapidly. Detections that cluster in a
-        small area for >max_stationary_frames are almost certainly false
-        positives on players, net posts, or static background features.
-
-        Args:
-            ball_track: Ball position track.
-            max_stationary_frames: Max consecutive frames allowed at same spot.
-            stationary_radius: Pixel radius to consider as "same position".
-
-        Returns:
-            Cleaned ball track with stationary clusters removed.
-        """
+        """Remove detections that remain stationary for too many frames."""
         if len(ball_track) < max_stationary_frames:
             return ball_track
 
@@ -349,7 +356,6 @@ class BallTracker:
                 i += 1
                 continue
 
-            # Find how many consecutive frames stay within stationary_radius
             cluster_start = i
             ref_x, ref_y = result[i]
             j = i + 1
@@ -414,7 +420,6 @@ class BallTracker:
         if len(list_det) - min_value > min_track:
             result.append([min_value, len(list_det)])
 
-        # Filter out subtracks with no valid detections
         result = [
             r for r in result
             if any(ball_track[i][0] is not None for i in range(r[0], r[1]))
@@ -429,11 +434,9 @@ class BallTracker:
         x_arr = np.array([c[0] if c[0] is not None else np.nan for c in coords])
         y_arr = np.array([c[1] if c[1] is not None else np.nan for c in coords])
 
-        # If all coordinates are None/NaN, return original coords unchanged
         if np.isnan(x_arr).all():
             return list(coords)
 
-        # Interpolate NaN values
         nans_x = np.isnan(x_arr)
         if nans_x.any() and not nans_x.all():
             indices = np.arange(len(x_arr))

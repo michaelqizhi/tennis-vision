@@ -1,0 +1,43 @@
+# Tennis Vision - Configuration Overrides
+# Values here override the defaults in src/config.py.
+# Delete or comment out any line to use the built-in default.
+
+# device: cuda  # "cuda" or "cpu" — auto-detected if omitted
+
+model:
+  tracknet_version: v2       # "v2" or "v4" (v5 planned — see ROADMAP.md)
+  # TrackNet V2 settings
+  tracknet_weights: weights/tracknet.pt
+  tracknet_input_width: 640
+  tracknet_input_height: 360
+  tracknet_out_channels: 256
+  # TrackNet V4 settings (auto-downloads weights on first use)
+  tracknet_v4_weights: weights/tracknet_v4.pth
+  tracknet_v4_input_width: 512
+  tracknet_v4_input_height: 288
+  # Court detector
+  court_weights: weights/court_detector.pt
+  court_input_width: 640
+  court_input_height: 360
+  court_out_channels: 15
+
+video:
+  max_frames: 0        # 0 = process all frames
+  output_codec: mp4v
+  output_ext: .mp4
+
+ball_tracking:
+  confidence_threshold: 127
+  v4_detection_threshold: 0.5
+  max_outlier_dist: 100.0
+  max_gap: 4
+  max_dist_gap: 80.0
+  min_track_length: 5
+  trace_length: 7
+  ball_color: [0, 255, 0]   # BGR green
+  ball_radius: 5
+
+court_detection:
+  heatmap_threshold: 130
+  refine_crop_size: 40
+  min_keypoints: 4
