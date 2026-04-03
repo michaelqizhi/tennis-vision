@@ -38,7 +38,7 @@ import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
 from einops import rearrange, repeat
 from einops.layers.torch import Rearrange  # noqa: F401
-from timm.models.layers import DropPath, to_2tuple, trunc_normal_
+from timm.layers import DropPath, to_2tuple, trunc_normal_
 from torch import einsum  # noqa: F401
 
 
@@ -364,7 +364,6 @@ class WindowAttention(nn.Module):
     def forward(self, x, xm, attn_kv=None, mask=None):
         B_, N, C = x.shape
         one = torch.ones_like(xm)
-        zero = torch.zeros_like(xm)
         xm = torch.where(xm < 0.1, one, one * 2)
         mm = xm @ xm.transpose(-2, -1)
         one = torch.ones_like(mm)
@@ -793,7 +792,7 @@ class BasicShadowFormer(nn.Module):
     def forward(self, x, xm, mask=None, img_size=(128, 128)):
         for blk in self.blocks:
             if self.use_checkpoint:
-                x = checkpoint.checkpoint(blk, x)
+                x = checkpoint.checkpoint(blk, x, xm, mask, img_size)
             else:
                 x = blk(x, xm, mask, img_size)
         return x
