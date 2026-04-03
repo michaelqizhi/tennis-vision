@@ -28,6 +28,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from src.config import get_config
 from src.features.court_detect.detector import CourtDetector, CourtDetectionResult
 from src.features.court_detect.court_template import REFERENCE_KPS_METERS
+from src.features.court_detect.shadow_removal import ShadowRemover
 
 # ---------------------------------------------------------------------------
 # Constants & paths
@@ -82,6 +83,7 @@ LINE_S_THRESHOLD = 80
 HOUGH_THRESHOLD = 60
 HOUGH_MIN_LENGTH = 100
 HOUGH_MAX_GAP = 40
+ENABLE_SHADOW_REMOVAL = True
 
 
 # ===================================================================
@@ -93,28 +95,34 @@ def estimate_net_y_from_cnn(
     court_detector: CourtDetector,
     frame_number: int = 0,
 ) -> tuple[int, CourtDetectionResult]:
-    """Estimate net y-position using CNN keypoints.
+    """Estimate net y-position (bottom of net) using CNN keypoints.
 
-    KP12 is the far service line center T (appears near top of court area).
-    The net sits ABOVE KP12 in the frame (lower y value).
+    The net bottom is the true half-court dividing line. We estimate it as:
+    - Best case: midpoint of KP12 (far service line) and KP13 (near service line),
+      since the net physically sits between them.
+    - Fallback: KP12 + 50px (empirically the net bottom is ~50px below far service line).
+    - Last resort: Sobel edge heuristic.
     """
     result = court_detector.detect_frame(frame, frame_number=frame_number)
     kps = result.keypoints
 
-    # Collect y-coords of KP8, KP9, KP12 (all at far service line level)
-    far_service_ys = []
-    for idx in [8, 9, 12]:
-        if idx < len(kps) and kps[idx][0] is not None:
-            far_service_ys.append(kps[idx][1])
+    # Try to use KP12 and KP13 to bracket the net
+    kp12_y = kps[12][1] if len(kps) > 12 and kps[12][0] is not None else None
+    kp13_y = kps[13][1] if len(kps) > 13 and kps[13][0] is not None else None
 
-    if far_service_ys:
-        # Net is slightly above (lower y) the far service line detections
-        net_y = int(min(far_service_ys) - 20)
-        net_y = max(0, net_y)
+    if kp12_y is not None and kp13_y is not None:
+        # Net top ≈ ~30px above KP12 (far service line)
+        # Net bottom ≈ midpoint of KP12 and KP13
+        # Crop at net top to maximize near-half area while excluding far court
+        net_y = int(kp12_y - 30)
+    elif kp12_y is not None:
+        # Net top ≈ 30px above far service line
+        net_y = int(kp12_y - 30)
     else:
         # CNN failed entirely — use heuristic
         net_y = estimate_net_y_heuristic(frame)
 
+    net_y = max(0, min(net_y, frame.shape[0] - 100))
     return net_y, result
 
 
@@ -464,9 +472,12 @@ def detect_lines_near_half(
 ) -> np.ndarray | None:
     """Run HoughLinesP on the court-line-filtered mask."""
     # Light morphological cleanup
-    kernel = np.ones((3, 3), np.uint8)
-    cleaned = cv2.morphologyEx(line_mask, cv2.MORPH_CLOSE, kernel, iterations=1)
-    cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, kernel, iterations=1)
+    # Use (1,3) kernel for OPEN to preserve thin horizontal lines (e.g. service line)
+    # while still removing isolated noise pixels
+    kernel_close = np.ones((3, 3), np.uint8)
+    kernel_open = np.ones((1, 3), np.uint8)
+    cleaned = cv2.morphologyEx(line_mask, cv2.MORPH_CLOSE, kernel_close, iterations=1)
+    cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, kernel_open, iterations=1)
 
     lines = cv2.HoughLinesP(
         cleaned, 1, np.pi / 180,
@@ -590,11 +601,14 @@ def identify_near_half_lines(
     # --- Vertical lines ---
     if len(vertical) >= 1:
         ref_y = frame_height * 0.8
+        min_vline_length = frame_width * 0.15  # reject short noise fragments
         scored_v = []
         for seg in vertical:
+            length = np.hypot(seg[2] - seg[0], seg[3] - seg[1])
+            if length < min_vline_length:
+                continue  # skip short fragments
             x_at_ref = _line_x_at_y(seg, ref_y)
             if x_at_ref is not None:
-                length = np.hypot(seg[2] - seg[0], seg[3] - seg[1])
                 scored_v.append((x_at_ref, length, seg))
         scored_v.sort(key=lambda x: x[0])  # left to right
 
@@ -1491,6 +1505,7 @@ def run_agrawal_pipeline(
     frame_idx: int,
     court_detector: CourtDetector,
     kalman: HomographyKalmanFilter | None = None,
+    shadow_remover: "ShadowRemover | None" = None,
 ) -> dict:
     """Run the full Agrawal-inspired pipeline on a single frame."""
     t0 = time.time()
@@ -1507,6 +1522,17 @@ def run_agrawal_pipeline(
     near_half, y_offset = crop_near_half(frame, net_y)
     print(f"  [Stage 1] Near-half crop: {near_half.shape[1]}×{near_half.shape[0]}, "
           f"y_offset={y_offset}")
+
+    # --- Stage 1.5: Shadow removal (optional) ---
+    if shadow_remover is not None:
+        t_sr = time.time()
+        near_half_sr = shadow_remover.remove_shadows(near_half)
+        print(f"  [Stage 1.5] Shadow removal ({time.time()-t_sr:.3f}s)")
+        # Save diagnostic before/after
+        diag_path = OUTPUT_DIR / f"shadow_removal_frame_{frame_idx}.jpg"
+        diag = np.hstack([near_half, near_half_sr])
+        cv2.imwrite(str(diag_path), diag)
+        near_half = near_half_sr
 
     # --- Stage 2: Court color detection ---
     t2 = time.time()
@@ -1701,6 +1727,9 @@ def main():
     # Initialize Kalman smoother for temporal consistency
     kalman = HomographyKalmanFilter()
 
+    # Initialize shadow remover (optional)
+    shadow_remover = ShadowRemover() if ENABLE_SHADOW_REMOVAL else None
+
     # Process each frame
     all_results = []
     for idx in FRAME_INDICES:
@@ -1710,7 +1739,7 @@ def main():
         print(f"Processing frame {idx}")
         print(f"{'='*70}")
 
-        result = run_agrawal_pipeline(frames[idx], idx, court_detector, kalman)
+        result = run_agrawal_pipeline(frames[idx], idx, court_detector, kalman, shadow_remover)
 
         # Save diagnostic composite
         out_path = OUTPUT_DIR / f"agrawal_frame_{idx}.jpg"
