@@ -80,8 +80,16 @@ NEIGHBORHOOD_SIZE = 7
 MIN_COURT_NEIGHBORS = 4
 LINE_V_THRESHOLD = 150
 LINE_S_THRESHOLD = 80
-HOUGH_THRESHOLD = 60
-HOUGH_MIN_LENGTH = 100
+
+# Saturation-based Agrawal (color-agnostic)
+# Saturation-based Agrawal (color-agnostic)
+SAT_COURT_THRESHOLD = 50    # S > this = chromatic surface for neighbor counting
+SAT_LINE_S_MAX = 50         # S < this = line candidate (includes anti-aliased edges)
+SAT_LINE_V_MIN = 150        # V > this = bright (line candidate)
+TOPHAT_KERNEL_SIZE = 23      # Morphological kernel for white top-hat (> line width ~5-15px)
+TOPHAT_THRESHOLD = 30        # Minimum top-hat response to be a line candidate
+HOUGH_THRESHOLD = 30
+HOUGH_MIN_LENGTH = 80
 HOUGH_MAX_GAP = 40
 ENABLE_SHADOW_REMOVAL = True
 
@@ -90,40 +98,80 @@ ENABLE_SHADOW_REMOVAL = True
 # Stage 1: Net detection / near-half crop
 # ===================================================================
 
+def estimate_net_y_from_yolo(
+    frame: np.ndarray,
+    net_detector,
+    conf_threshold: float = 0.25,
+) -> tuple[int, int] | None:
+    """Estimate net position using finetuned YOLOv8 net detector.
+
+    Returns (net_top_y, net_bottom_y) from the highest-confidence detection,
+    or None if no detection meets the confidence threshold.
+    """
+    results = net_detector(frame, verbose=False)
+    boxes = results[0].boxes
+    if boxes is None or len(boxes) == 0:
+        return None
+
+    # Filter by confidence
+    confs = boxes.conf.cpu().numpy()
+    mask = confs >= conf_threshold
+    if not mask.any():
+        return None
+
+    # Take highest confidence detection
+    best_idx = confs[mask].argmax()
+    filtered_boxes = boxes.xyxy.cpu().numpy()[mask]
+    y1 = int(filtered_boxes[best_idx][1])  # top of bbox
+    y2 = int(filtered_boxes[best_idx][3])  # bottom of bbox
+    return y1, y2
+
+
 def estimate_net_y_from_cnn(
     frame: np.ndarray,
     court_detector: CourtDetector,
     frame_number: int = 0,
-) -> tuple[int, CourtDetectionResult]:
-    """Estimate net y-position (bottom of net) using CNN keypoints.
+    net_detector=None,
+) -> tuple[int, CourtDetectionResult, str]:
+    """Estimate net y-position using YOLO net detector (primary) or CNN (fallback).
 
-    The net bottom is the true half-court dividing line. We estimate it as:
-    - Best case: midpoint of KP12 (far service line) and KP13 (near service line),
-      since the net physically sits between them.
-    - Fallback: KP12 + 50px (empirically the net bottom is ~50px below far service line).
-    - Last resort: Sobel edge heuristic.
+    Returns (net_y, cnn_result, source, crop_margin) where:
+    - net_y: the net bottom position (crop reference)
+    - crop_margin: how many pixels above net_y to include in crop
     """
+    # Always run CNN for keypoints (used later in pipeline for fallback)
     result = court_detector.detect_frame(frame, frame_number=frame_number)
-    kps = result.keypoints
 
-    # Try to use KP12 and KP13 to bracket the net
+    # Primary: YOLO net detector
+    if net_detector is not None:
+        yolo_result = estimate_net_y_from_yolo(frame, net_detector)
+        if yolo_result is not None:
+            net_top, net_bottom = yolo_result
+            # Crop at net bottom — the true half-court dividing line.
+            # Use 1.5× net height as dynamic margin: includes court surface
+            # above the net where sidelines extend, proportional to perspective.
+            net_height = net_bottom - net_top
+            crop_margin = int(net_height * 1.7)
+            net_y = max(0, min(net_bottom, frame.shape[0] - 100))
+            return net_y, result, f"yolo(top={net_top},bot={net_bottom})", crop_margin
+
+    # Fallback: CNN keypoints (net_y ≈ net top, uses default margin)
+    kps = result.keypoints
     kp12_y = kps[12][1] if len(kps) > 12 and kps[12][0] is not None else None
     kp13_y = kps[13][1] if len(kps) > 13 and kps[13][0] is not None else None
 
     if kp12_y is not None and kp13_y is not None:
-        # Net top ≈ ~30px above KP12 (far service line)
-        # Net bottom ≈ midpoint of KP12 and KP13
-        # Crop at net top to maximize near-half area while excluding far court
         net_y = int(kp12_y - 30)
+        source = "cnn_kp12_kp13"
     elif kp12_y is not None:
-        # Net top ≈ 30px above far service line
         net_y = int(kp12_y - 30)
+        source = "cnn_kp12"
     else:
-        # CNN failed entirely — use heuristic
         net_y = estimate_net_y_heuristic(frame)
+        source = "heuristic"
 
     net_y = max(0, min(net_y, frame.shape[0] - 100))
-    return net_y, result
+    return net_y, result, source, 20  # default margin for CNN path
 
 
 def estimate_net_y_heuristic(frame: np.ndarray) -> int:
@@ -311,6 +359,56 @@ def agrawal_court_line_filter(
     return line_mask
 
 
+def agrawal_saturation_line_filter(
+    frame_bgr: np.ndarray,
+    neighborhood: int = NEIGHBORHOOD_SIZE,
+    min_court_neighbors: int = MIN_COURT_NEIGHBORS,
+    sat_court_thresh: int = SAT_COURT_THRESHOLD,
+    sat_line_s_max: int = SAT_LINE_S_MAX,
+    sat_line_v_min: int = SAT_LINE_V_MIN,
+    tophat_ksize: int = TOPHAT_KERNEL_SIZE,
+    tophat_thresh: int = TOPHAT_THRESHOLD,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Color-agnostic Agrawal filter using white top-hat + saturation gate.
+
+    White top-hat on V channel extracts only thin bright features (lines),
+    naturally ignoring large bright areas (court surface, overexposure).
+    Saturation gate ensures detected features are on a chromatic surface
+    (court/surround), not sky or background.
+
+    Works on any court color combination and any court brightness.
+
+    Returns (line_mask, court_mask, hsv) where masks are uint8 binary (0/255)
+    and hsv is the precomputed HSV image.
+    """
+    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+    S = hsv[:, :, 1]
+    V = hsv[:, :, 2]
+
+    # White top-hat: extracts thin bright features smaller than kernel
+    # Court surface (large, uniform) is suppressed; lines (thin, bright) survive
+    kernel_morph = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                             (tophat_ksize, tophat_ksize))
+    tophat = cv2.morphologyEx(V, cv2.MORPH_TOPHAT, kernel_morph)
+
+    # Line candidate: strong top-hat response AND achromatic AND bright
+    line_candidate = ((tophat > tophat_thresh) &
+                      (S < sat_line_s_max) &
+                      (V > sat_line_v_min))
+
+    # Court surface = any chromatic pixel (for neighbor counting)
+    court_mask = (S > sat_court_thresh).astype(np.uint8) * 255
+
+    # Agrawal neighbor logic: line pixel must be surrounded by court pixels
+    court_01 = (court_mask > 0).astype(np.float32)
+    kernel = np.ones((neighborhood, neighborhood), dtype=np.float32)
+    neighbor_count = cv2.filter2D(court_01, cv2.CV_32F, kernel)
+    has_neighbors = (neighbor_count >= min_court_neighbors)
+
+    line_mask = (line_candidate & has_neighbors).astype(np.uint8) * 255
+    return line_mask, court_mask, hsv
+
+
 # ===================================================================
 # Stage 4: Hough line detection + classification (reused logic)
 # ===================================================================
@@ -464,28 +562,133 @@ def merge_collinear_segments(
     return merged
 
 
+def _find_baseline_segment(
+    lines: np.ndarray | None,
+    frame_height: int,
+    frame_width: int,
+) -> np.ndarray | None:
+    """Find the baseline: longest near-horizontal line in the bottom half.
+
+    The baseline is the most reliably detected court feature — it's the
+    longest, highest-contrast horizontal line and always appears near the
+    bottom of the near-half crop.
+    """
+    if lines is None:
+        return None
+
+    candidates = []
+    for line in lines:
+        seg = line[0] if line.ndim == 2 else line
+        x1, y1, x2, y2 = seg
+        angle = abs(np.degrees(np.arctan2(y2 - y1, x2 - x1))) % 180
+        length = np.hypot(x2 - x1, y2 - y1)
+        avg_y = (y1 + y2) / 2.0
+
+        is_horizontal = angle < 15 or angle > 165
+        is_bottom = avg_y > frame_height * 0.45
+        is_long = length > frame_width * 0.15
+
+        if is_horizontal and is_bottom and is_long:
+            candidates.append((length, seg.copy()))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return candidates[0][1]
+
+
+def create_court_spatial_mask(
+    baseline: np.ndarray,
+    frame_height: int,
+    frame_width: int,
+    margin_ratio: float = 0.05,
+) -> np.ndarray:
+    """Create a spatial mask covering the court's horizontal extent.
+
+    Uses the baseline segment endpoints (which correspond to the doubles
+    sideline intersections) to define the court's lateral bounds. Pixels
+    outside these bounds are zeroed, eliminating surround noise (green
+    areas, fences, equipment) that creates false vertical lines.
+
+    A small margin is added to avoid clipping lines at the court boundary.
+    """
+    bl_x_left = min(baseline[0], baseline[2])
+    bl_x_right = max(baseline[0], baseline[2])
+    bl_span = bl_x_right - bl_x_left
+    margin = max(int(margin_ratio * bl_span), 15)
+
+    spatial_mask = np.zeros((frame_height, frame_width), dtype=np.uint8)
+    x_lo = max(0, bl_x_left - margin)
+    x_hi = min(frame_width, bl_x_right + margin)
+    spatial_mask[:, x_lo:x_hi] = 255
+    return spatial_mask
+
+
 def detect_lines_near_half(
     line_mask: np.ndarray,
     hough_threshold: int = HOUGH_THRESHOLD,
     min_length: int = HOUGH_MIN_LENGTH,
     max_gap: int = HOUGH_MAX_GAP,
-) -> np.ndarray | None:
-    """Run HoughLinesP on the court-line-filtered mask."""
-    # Light morphological cleanup
-    # Use (1,3) kernel for OPEN to preserve thin horizontal lines (e.g. service line)
-    # while still removing isolated noise pixels
-    kernel_close = np.ones((3, 3), np.uint8)
-    kernel_open = np.ones((1, 3), np.uint8)
-    cleaned = cv2.morphologyEx(line_mask, cv2.MORPH_CLOSE, kernel_close, iterations=1)
-    cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, kernel_open, iterations=1)
+) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
+    """Two-pass Hough detection with baseline-anchored spatial masking.
 
-    lines = cv2.HoughLinesP(
+    Pass 1: Run Hough on the full line mask to find the baseline (the
+    strongest near-horizontal line near the bottom of the frame). The
+    baseline is always detectable because it's long, high-contrast, and
+    unaffected by surround noise (which creates vertical, not horizontal,
+    false lines).
+
+    Pass 2: Use the baseline endpoints to create a rectangular spatial
+    mask covering only the court's horizontal extent. Apply this mask to
+    the line pixels, then re-run Hough. This eliminates false vertical
+    lines from the surround while preserving thin court features like
+    singles sidelines.
+
+    This solves two problems simultaneously:
+    - Single-color courts (e.g., blue + green surround): surround noise
+      that created false V lines is spatially excluded.
+    - Multi-color courts: no hue-specific logic, works on any color.
+
+    Returns (lines, baseline_segment, spatial_mask).
+    """
+    h, w = line_mask.shape[:2]
+
+    # Light morphological cleanup — close small gaps in line pixels.
+    # NOTE: Only CLOSE, no OPEN. The horizontal OPEN kernel (1,3) erodes
+    # thin near-vertical features (sidelines) when using the saturation-based
+    # filter. The top-hat pre-filter already provides clean output.
+    kernel_close = np.ones((3, 3), np.uint8)
+    cleaned = cv2.morphologyEx(line_mask, cv2.MORPH_CLOSE, kernel_close, iterations=1)
+
+    # --- Pass 1: Find the baseline ---
+    pass1_lines = cv2.HoughLinesP(
         cleaned, 1, np.pi / 180,
         threshold=hough_threshold,
         minLineLength=min_length,
         maxLineGap=max_gap,
     )
-    return lines
+
+    baseline = _find_baseline_segment(pass1_lines, h, w)
+
+    if baseline is None:
+        # No baseline found — fall back to unmasked detection
+        return pass1_lines, None, None
+
+    # --- Create spatial mask from baseline endpoints ---
+    spatial_mask = create_court_spatial_mask(baseline, h, w)
+
+    # --- Pass 2: Masked Hough for all lines ---
+    masked = cv2.bitwise_and(cleaned, spatial_mask)
+
+    pass2_lines = cv2.HoughLinesP(
+        masked, 1, np.pi / 180,
+        threshold=hough_threshold,
+        minLineLength=min_length,
+        maxLineGap=max_gap,
+    )
+
+    return pass2_lines, baseline, spatial_mask
 
 
 # ===================================================================
@@ -549,6 +752,7 @@ def identify_near_half_lines(
     }
 
     cx = frame_width / 2.0
+    bl_y = None  # will be set if baseline is detected (used by vertical filter)
 
     # --- Horizontal lines ---
     min_xspan = frame_width * 0.08
@@ -601,7 +805,13 @@ def identify_near_half_lines(
     # --- Vertical lines ---
     if len(vertical) >= 1:
         ref_y = frame_height * 0.8
-        min_vline_length = frame_width * 0.15  # reject short noise fragments
+        # Baseline-relative min-length: sidelines span from baseline to net,
+        # so their length ≈ bl_y. Use 0.85× for margin on partial detections.
+        # Fallback to crop_height * 0.40 if no baseline was detected.
+        if bl_y is not None:
+            min_vline_length = bl_y * 0.85
+        else:
+            min_vline_length = frame_height * 0.40
         scored_v = []
         for seg in vertical:
             length = np.hypot(seg[2] - seg[0], seg[3] - seg[1])
@@ -1506,6 +1716,7 @@ def run_agrawal_pipeline(
     court_detector: CourtDetector,
     kalman: HomographyKalmanFilter | None = None,
     shadow_remover: "ShadowRemover | None" = None,
+    net_detector=None,
 ) -> dict:
     """Run the full Agrawal-inspired pipeline on a single frame."""
     t0 = time.time()
@@ -1513,44 +1724,73 @@ def run_agrawal_pipeline(
 
     # --- Stage 1: Net detection & crop ---
     t1 = time.time()
-    net_y, cnn_result = estimate_net_y_from_cnn(frame, court_detector, frame_idx)
+    net_y, cnn_result, net_source, crop_margin = estimate_net_y_from_cnn(
+        frame, court_detector, frame_idx, net_detector=net_detector)
     cnn_kps = cnn_result.keypoints
     cnn_detected = sum(1 for p in cnn_kps if p[0] is not None)
-    print(f"  [Stage 1] Net y={net_y}, CNN detected {cnn_detected}/14 keypoints "
+    print(f"  [Stage 1] Net y={net_y} (source={net_source}), "
+          f"margin={crop_margin}, CNN detected {cnn_detected}/14 keypoints "
           f"({time.time()-t1:.2f}s)")
 
-    near_half, y_offset = crop_near_half(frame, net_y)
+    near_half, y_offset = crop_near_half(frame, net_y, margin=crop_margin)
     print(f"  [Stage 1] Near-half crop: {near_half.shape[1]}×{near_half.shape[0]}, "
           f"y_offset={y_offset}")
 
-    # --- Stage 1.5: Shadow removal (optional) ---
+    # --- Stage 1.5: Shadow removal (optional, with auto-gating) ---
     if shadow_remover is not None:
         t_sr = time.time()
-        near_half_sr = shadow_remover.remove_shadows(near_half)
-        print(f"  [Stage 1.5] Shadow removal ({time.time()-t_sr:.3f}s)")
-        # Save diagnostic before/after
-        diag_path = OUTPUT_DIR / f"shadow_removal_frame_{frame_idx}.jpg"
-        diag = np.hstack([near_half, near_half_sr])
-        cv2.imwrite(str(diag_path), diag)
-        near_half = near_half_sr
+        should_apply, discrim, shadow_ratio = ShadowRemover.should_remove_shadows(near_half)
+        if should_apply:
+            near_half_sr = shadow_remover.remove_shadows(near_half)
+            print(f"  [Stage 1.5] Shadow removal APPLIED "
+                  f"(discrim={discrim:.3f}, shadow_ratio={shadow_ratio:.2f}, "
+                  f"{time.time()-t_sr:.3f}s)")
+            diag_path = OUTPUT_DIR / f"shadow_removal_frame_{frame_idx}.jpg"
+            diag = np.hstack([near_half, near_half_sr])
+            cv2.imwrite(str(diag_path), diag)
+            near_half = near_half_sr
+        else:
+            print(f"  [Stage 1.5] Shadow removal SKIPPED "
+                  f"(discrim={discrim:.3f}, shadow_ratio={shadow_ratio:.2f}, "
+                  f"{time.time()-t_sr:.3f}s)")
 
-    # --- Stage 2: Court color detection ---
+    # --- Stage 2+3: Saturation-based Agrawal filter (color-agnostic) ---
     t2 = time.time()
-    court_color, court_type = detect_court_color_kmeans(near_half, n_samples=N_COLOR_SAMPLES)
-    print(f"  [Stage 2] Court color: H={court_color[0]} S={court_color[1]} "
-          f"V={court_color[2]}, type={court_type} ({time.time()-t2:.2f}s)")
+    line_mask, court_color_mask, hsv_full = agrawal_saturation_line_filter(near_half)
+    # Derive court_color for logging/visualization (median HSV of chromatic pixels)
+    chromatic_px = hsv_full[court_color_mask > 0]
+    if len(chromatic_px) > 0:
+        court_h = int(np.median(chromatic_px[:, 0]))
+        court_s = int(np.median(chromatic_px[:, 1]))
+        court_v = int(np.median(chromatic_px[:, 2]))
+    else:
+        court_h, court_s, court_v = 0, 0, 0
+    court_color = np.array([court_h, court_s, court_v], dtype=np.uint8)
+    # Classify for logging only
+    if 90 <= court_h <= 125:
+        court_type = "blue"
+    elif 35 <= court_h <= 85:
+        court_type = "green"
+    elif court_h <= 25 or court_h >= 170:
+        court_type = "clay"
+    else:
+        court_type = "unknown"
+    print(f"  [Stage 2+3] Saturation Agrawal: {np.count_nonzero(line_mask)} line pixels, "
+          f"court={court_type}(H={court_h} S={court_s} V={court_v}) ({time.time()-t2:.3f}s)")
 
-    # --- Stage 3: Agrawal court-line filter ---
-    t3 = time.time()
-    court_color_mask = build_court_color_mask(near_half, court_color)
-    line_mask = agrawal_court_line_filter(near_half, court_color)
-    print(f"  [Stage 3] Agrawal filter: {np.count_nonzero(line_mask)} line pixels "
-          f"({time.time()-t3:.3f}s)")
-
-    # --- Stage 4: Hough line detection ---
+    # --- Stage 4: Two-pass Hough with baseline-anchored spatial masking ---
     t4 = time.time()
-    raw_lines = detect_lines_near_half(line_mask)
+    raw_lines, baseline_seg, spatial_mask = detect_lines_near_half(line_mask)
     n_raw = 0 if raw_lines is None else len(raw_lines)
+    if baseline_seg is not None:
+        bl_x_left = min(baseline_seg[0], baseline_seg[2])
+        bl_x_right = max(baseline_seg[0], baseline_seg[2])
+        masked_px = np.count_nonzero(cv2.bitwise_and(line_mask, spatial_mask))
+        total_px = np.count_nonzero(line_mask)
+        print(f"  [Stage 4] Baseline anchor: x=[{bl_x_left},{bl_x_right}], "
+              f"spatial mask kept {masked_px}/{total_px} line pixels")
+    else:
+        print(f"  [Stage 4] No baseline found — using unmasked detection")
     horizontal, vertical = classify_lines_courtside(raw_lines)
     horizontal = merge_collinear_segments(horizontal)
     vertical = merge_collinear_segments(vertical)
@@ -1724,6 +1964,16 @@ def main():
     config = get_config()
     court_detector = CourtDetector(config, use_refine_kps=True, use_homography=True)
 
+    # Initialize YOLO net detector
+    net_detector = None
+    net_weights = PROJECT_ROOT / "weights" / "net_detector.pt"
+    if net_weights.exists():
+        from ultralytics import YOLO
+        net_detector = YOLO(str(net_weights))
+        print(f"  YOLO net detector loaded: {net_weights}")
+    else:
+        print(f"  YOLO net detector not found at {net_weights}, using CNN fallback")
+
     # Initialize Kalman smoother for temporal consistency
     kalman = HomographyKalmanFilter()
 
@@ -1739,7 +1989,9 @@ def main():
         print(f"Processing frame {idx}")
         print(f"{'='*70}")
 
-        result = run_agrawal_pipeline(frames[idx], idx, court_detector, kalman, shadow_remover)
+        result = run_agrawal_pipeline(
+            frames[idx], idx, court_detector, kalman, shadow_remover,
+            net_detector=net_detector)
 
         # Save diagnostic composite
         out_path = OUTPUT_DIR / f"agrawal_frame_{idx}.jpg"
