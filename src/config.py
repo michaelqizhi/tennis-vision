@@ -70,6 +70,18 @@ class CourtDetectionConfig:
     refine_crop_size: int = 40
     # Minimum keypoints for valid detection
     min_keypoints: int = 4
+    # Court boundary filter
+    boundary_x_margin: float = 3.0    # meters beyond sideline
+    boundary_y_margin: float = 5.0    # meters beyond baseline
+    # Frame selector
+    min_court_color_score: float = 0.15
+    min_sharpness: float = 100.0
+    frame_sample_interval: float = 5.0  # seconds
+    # Homography monitor
+    monitor_interval: int = 30         # frames between validity checks
+    monitor_ncc_threshold: float = 0.65
+    monitor_consensus_ratio: float = 0.6
+    monitor_cooldown: int = 5          # frames to wait after camera bump
 
 
 @dataclass

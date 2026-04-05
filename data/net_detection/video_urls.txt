@@ -1,0 +1,32 @@
+# YouTube URLs for tennis net detection dataset.
+# Target: ~18 videos, diverse angles/courts/conditions.
+# The net must be visible in each video.
+#
+# Format: one URL per line. Lines starting with # are comments.
+
+# ── Behind baseline / court-level (primary angle) ────────────────────
+https://www.youtube.com/watch?v=ndywUMlBlgg  # Siacourt: amateur club battle, indoor astroturf, behind baseline
+https://www.youtube.com/watch?v=4apx6gd5Uxs  # Amateur match NTRP 4.0, full match
+https://www.youtube.com/watch?v=a2L6RQS3c1A  # Amateur tennis singles matches, indoor hardcourt
+https://www.youtube.com/watch?v=OIvdfxWkCVg  # Amateur tennis singles match, indoor hardcourt
+https://www.youtube.com/watch?v=cM3IYhkjwaI  # Court level highlight, amateur tennis
+https://www.youtube.com/watch?v=7x5PsSj3gKg  # Doubles tennis practice rallies
+https://www.youtube.com/watch?v=k2sKYrCvbV0  # GoPro tennis rally, wide angle view
+https://www.youtube.com/watch?v=S5Ct0cod66A  # Tennis cross court rally drills, phone on tripod
+https://www.youtube.com/watch?v=M6XbntNXH_w  # Outdoor baseline rallies, stationary camera, 2024
+https://www.youtube.com/watch?v=LcHpXuJVKis  # Outdoor windy baseline rallies, stationary camera, 2024
+
+# ── Courtside / side angle ───────────────────────────────────────────
+https://www.youtube.com/watch?v=-iqlba7QYts  # Best camera angle to film tennis, courtside demo
+https://www.youtube.com/watch?v=uodbDnawdGY  # Amateur tennis masters 2024, outdoor highlight
+
+# ── Broadcast / elevated angle ───────────────────────────────────────
+https://www.youtube.com/watch?v=AwS6Gh1ZfGw  # Night tennis, king of the court under lights
+
+# ── Additional: doubles, outdoor, different conditions ───────────────
+https://www.youtube.com/watch?v=N2fvrt1osrI  # Amateur recreational doubles #2, full match
+https://www.youtube.com/watch?v=3dBzz0fOMsk  # Recreational doubles, intermediate level
+https://www.youtube.com/watch?v=kJDyv3oivxc  # Recreational tennis doubles
+https://www.youtube.com/watch?v=8Hie9byCk_8  # Men's doubles full video, amateur players
+https://www.youtube.com/watch?v=MlkSSv7OepY  # Amateur doubles, indoor hardcourt
+https://www.youtube.com/watch?v=pjuS_jlfUg0  # Amateur doubles match, club players, full

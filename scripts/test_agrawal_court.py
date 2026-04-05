@@ -553,6 +553,60 @@ def agrawal_saturation_line_filter(
     return line_mask, court_mask, hsv, effective_tophat_thresh
 
 
+def agrawal_local_contrast_line_filter(
+    frame_bgr: np.ndarray,
+    neighborhood: int = NEIGHBORHOOD_SIZE,
+    min_court_neighbors: int = MIN_COURT_NEIGHBORS,
+    tophat_ksize: int = TOPHAT_KERNEL_SIZE,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, int]:
+    """Local-contrast Agrawal filter using V top-hat + S black-hat.
+
+    Detects lines as thin features that are locally brighter (V top-hat)
+    AND locally less saturated (S black-hat) than their surroundings.
+    No global color or saturation thresholds — purely local contrast.
+
+    Returns (line_mask, court_mask, hsv, thresh_v, thresh_s).
+    """
+    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+    S = hsv[:, :, 1]
+    V = hsv[:, :, 2]
+
+    kernel_morph = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                             (tophat_ksize, tophat_ksize))
+
+    tophat_v = cv2.morphologyEx(V, cv2.MORPH_TOPHAT, kernel_morph)
+    blackhat_s = cv2.morphologyEx(S, cv2.MORPH_BLACKHAT, kernel_morph)
+
+    # Adaptive thresholds via Otsu
+    court_region = (V > 30)
+    tophat_court = tophat_v[court_region]
+    if len(tophat_court) > 100:
+        otsu_v, _ = cv2.threshold(tophat_court, 0, 255,
+                                   cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        thresh_v = max(int(otsu_v * 0.7), 5)
+    else:
+        thresh_v = 20
+
+    blackhat_court = blackhat_s[court_region]
+    if len(blackhat_court) > 100:
+        otsu_s, _ = cv2.threshold(blackhat_court, 0, 255,
+                                   cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        thresh_s = max(int(otsu_s * 0.7), 5)
+    else:
+        thresh_s = 15
+
+    line_candidate = (tophat_v > thresh_v) & (blackhat_s > thresh_s)
+    court_mask = (V > 30).astype(np.uint8) * 255
+
+    court_01 = (court_mask > 0).astype(np.float32)
+    kernel = np.ones((neighborhood, neighborhood), dtype=np.float32)
+    neighbor_count = cv2.filter2D(court_01, cv2.CV_32F, kernel)
+    has_neighbors = (neighbor_count >= min_court_neighbors)
+
+    line_mask = (line_candidate & has_neighbors).astype(np.uint8) * 255
+    return line_mask, court_mask, hsv, thresh_v, thresh_s
+
+
 # ===================================================================
 # Stage 4: Hough line detection + classification (reused logic)
 # ===================================================================
@@ -660,6 +714,7 @@ def merge_collinear_segments(
     segments: list[np.ndarray],
     angle_tol: float = 10.0,
     dist_tol: float = 30.0,
+    max_gap: float = 80.0,
 ) -> list[np.ndarray]:
     """Merge segments that are nearly collinear and close together."""
     if len(segments) <= 1:
@@ -691,17 +746,39 @@ def merge_collinear_segments(
                 group.append(segments[j])
                 used[j] = True
 
-        pts = np.concatenate([np.array([[s[0], s[1]], [s[2], s[3]]]) for s in group])
+        # Get line direction from the longest segment in the group
         best = max(group, key=lambda s: np.hypot(s[2] - s[0], s[3] - s[1]))
         dx, dy = best[2] - best[0], best[3] - best[1]
         norm = max(np.hypot(dx, dy), 1e-6)
         ux, uy = dx / norm, dy / norm
-        projs = pts[:, 0] * ux + pts[:, 1] * uy
-        imin, imax = np.argmin(projs), np.argmax(projs)
-        merged.append(np.array([
-            int(pts[imin, 0]), int(pts[imin, 1]),
-            int(pts[imax, 0]), int(pts[imax, 1]),
-        ]))
+
+        # For each segment, compute (min_proj, max_proj, min_pt, max_pt)
+        intervals = []
+        for s in group:
+            p1 = s[0] * ux + s[1] * uy
+            p2 = s[2] * ux + s[3] * uy
+            if p1 <= p2:
+                intervals.append((p1, p2, (s[0], s[1]), (s[2], s[3])))
+            else:
+                intervals.append((p2, p1, (s[2], s[3]), (s[0], s[1])))
+
+        # Sort by start projection
+        intervals.sort(key=lambda x: x[0])
+
+        # Greedily merge intervals within max_gap
+        clusters = [intervals[0]]
+        for lo, hi, pt_lo, pt_hi in intervals[1:]:
+            prev_lo, prev_hi, prev_pt_lo, prev_pt_hi = clusters[-1]
+            if lo - prev_hi <= max_gap:
+                new_hi = max(prev_hi, hi)
+                new_pt_hi = pt_hi if hi >= prev_hi else prev_pt_hi
+                clusters[-1] = (prev_lo, new_hi, prev_pt_lo, new_pt_hi)
+            else:
+                clusters.append((lo, hi, pt_lo, pt_hi))
+
+        # Each cluster becomes an output segment
+        for _, _, (x1, y1), (x2, y2) in clusters:
+            merged.append(np.array([int(x1), int(y1), int(x2), int(y2)]))
 
     return merged
 
@@ -884,6 +961,14 @@ def _seg_signed_slope(seg: np.ndarray) -> float:
     return (y2 - y1) / dx
 
 
+def _point_to_line_dist(px: float, py: float, seg: np.ndarray) -> float:
+    """Perpendicular distance from point (px, py) to the line defined by segment."""
+    x1, y1, x2, y2 = seg.astype(float)
+    dx, dy = x2 - x1, y2 - y1
+    length = max(np.hypot(dx, dy), 1e-6)
+    return abs(dy * px - dx * py + x2 * y1 - y2 * x1) / length
+
+
 def identify_near_half_lines(
     horizontal: list[np.ndarray],
     vertical: list[np.ndarray],
@@ -904,7 +989,6 @@ def identify_near_half_lines(
         "near_baseline": None,
         "left_singles": None,
         "right_singles": None,
-        "center_service": None,
         "left_doubles": None,
         "right_doubles": None,
     }
@@ -928,39 +1012,10 @@ def identify_near_half_lines(
     if len(scored) >= 1:
         # Near baseline: the bottommost wide line (highest y)
         result["near_baseline"] = scored[-1][2]
-        bl_slope = _seg_signed_slope(scored[-1][2])
-
-        # Near service line: must be above baseline, with consistent slope sign,
-        # and must overlap with the center region of the frame (not a far-side fragment)
-        service_candidates = []
         bl_y = scored[-1][0]
-        center_margin = frame_width * 0.15
-        for y_at_cx, length, seg in scored[:-1]:
-            if y_at_cx >= bl_y - 10:
-                continue  # too close to baseline
-            seg_x_min = min(seg[0], seg[2])
-            seg_x_max = max(seg[0], seg[2])
-            overlaps_center = not (seg_x_max < cx - center_margin or seg_x_min > cx + center_margin)
-            seg_slope = _seg_signed_slope(seg)
-            # Slope consistency check (relaxed)
-            slope_ok = False
-            if abs(bl_slope) < 0.01:
-                slope_ok = abs(seg_slope) < 0.3
-            else:
-                slope_ok = (bl_slope * seg_slope >= 0) or abs(seg_slope) < 0.05
+        baseline_seg = scored[-1][2]
 
-            if overlaps_center and slope_ok:
-                service_candidates.append((y_at_cx, length, seg))
-            elif not overlaps_center and slope_ok and length > frame_width * 0.2:
-                # Long line that doesn't overlap center — may be offset but valid
-                service_candidates.append((y_at_cx, length, seg))
-
-        if service_candidates:
-            # Prefer the longest candidate if multiple pass the slope test
-            service_candidates.sort(key=lambda x: -x[1])
-            result["near_service"] = service_candidates[0][2]
-
-    # --- Vertical lines ---
+    # --- Vertical lines (must run before service line to enable sideline constraint) ---
     if len(vertical) >= 1:
         ref_y = frame_height * 0.8
         # Baseline-relative min-length: sidelines span from baseline to net,
@@ -984,7 +1039,9 @@ def identify_near_half_lines(
         left_lines = [(x, ln, s) for x, ln, s in scored_v if x < cx]
         right_lines = [(x, ln, s) for x, ln, s in scored_v if x >= cx]
 
-        # Center service line: must be near the center
+        # Exclude center-court vertical lines from sideline groups.
+        # We don't identify the center service line — it's not needed for
+        # homography and can cause misidentification of sidelines.
         center_tolerance = frame_width * 0.15
         center_candidates = [(x, ln, s) for x, ln, s in scored_v
                              if abs(x - cx) < center_tolerance]
@@ -992,9 +1049,8 @@ def identify_near_half_lines(
         if center_candidates:
             best = min(center_candidates, key=lambda t: abs(t[0] - cx))
             center_seg = best[2]
-            result["center_service"] = center_seg
 
-        # Exclude center_service from sideline groups to prevent misidentification
+        # Exclude center line from sideline groups to prevent misidentification
         if center_seg is not None:
             left_lines = [(x, ln, s) for x, ln, s in left_lines
                           if not np.array_equal(s, center_seg)]
@@ -1013,6 +1069,28 @@ def identify_near_half_lines(
             result["right_doubles"] = right_lines[-1][2]
         elif len(right_lines) == 1:
             result["right_singles"] = right_lines[0][2]
+
+        # --- Doubles sideline must intersect baseline near its endpoints ---
+        bl = result.get("near_baseline")
+        if bl is not None:
+            bl_left_x = min(bl[0], bl[2])
+            bl_right_x = max(bl[0], bl[2])
+            bl_span = bl_right_x - bl_left_x
+            margin = bl_span * 0.15
+
+            for side_name in ["left_doubles", "right_doubles"]:
+                side_seg = result.get(side_name)
+                if side_seg is None:
+                    continue
+                pt = line_intersection(bl, side_seg, w=FRAME_W * 2, h=FRAME_H * 2)
+                if pt is None:
+                    print(f"    [Sideline] {side_name}: no intersection with baseline, removing")
+                    result[side_name] = None
+                    continue
+                if pt[0] < bl_left_x - margin or pt[0] > bl_right_x + margin:
+                    print(f"    [Sideline] {side_name}: intersection x={pt[0]:.0f} "
+                          f"outside baseline [{bl_left_x - margin:.0f}, {bl_right_x + margin:.0f}], removing")
+                    result[side_name] = None
 
         # --- Metric ratio constraint: disambiguate singles vs doubles ---
         # When only 1 vertical line per side, use court proportions to decide
@@ -1077,6 +1155,85 @@ def identify_near_half_lines(
                           f"reclassifying as doubles")
                     result["right_doubles"] = result["right_singles"]
                     result["right_singles"] = None
+
+    # --- Service line (uses baseline + sidelines) ---
+    if bl_y is not None and len(scored) >= 2:
+        baseline_xspan = abs(baseline_seg[2] - baseline_seg[0])
+        bl_angle = _seg_angle(baseline_seg)
+        expected_y = bl_y * (1.0 - 0.65)  # perspective-adjusted: ~65% up from baseline
+
+        service_candidates = []
+        for y_at_cx, length, seg in scored[:-1]:
+            # Constraint 1: Y-position band
+            candidate_y = y_at_cx
+            y_ratio = (bl_y - candidate_y) / bl_y if bl_y > 0 else 0.0
+            if y_ratio < 0.30 or y_ratio > 0.78:
+                print(f"    [Service] Rejected: y_ratio={y_ratio:.2f} outside [0.30, 0.78]")
+                continue
+
+            # Constraint 2: Width ≤ baseline
+            candidate_xspan = abs(seg[2] - seg[0])
+            if candidate_xspan > baseline_xspan:
+                print(f"    [Service] Rejected: xspan={candidate_xspan:.0f} > baseline={baseline_xspan:.0f}")
+                continue
+
+            # Constraint 3: Angle within 10° of baseline
+            seg_angle = _seg_angle(seg)
+            angle_diff = abs(seg_angle - bl_angle)
+            if angle_diff > 90:
+                angle_diff = 180 - angle_diff
+            if angle_diff >= 10:
+                print(f"    [Service] Rejected: angle_diff={angle_diff:.1f}° >= 10°")
+                continue
+
+            # Constraint 4: Sideline endpoint test (when sidelines detected)
+            left_sl = result["left_singles"]
+            right_sl = result["right_singles"]
+            if left_sl is not None or right_sl is not None:
+                tolerance = max(40, baseline_xspan * 0.04)
+                seg_left_x = min(seg[0], seg[2])
+                seg_right_x = max(seg[0], seg[2])
+                # Identify left/right endpoints with their y-values
+                if seg[0] <= seg[2]:
+                    lx, ly = float(seg[0]), float(seg[1])
+                    rx, ry = float(seg[2]), float(seg[3])
+                else:
+                    lx, ly = float(seg[2]), float(seg[3])
+                    rx, ry = float(seg[0]), float(seg[1])
+
+                sideline_ok = True
+                if left_sl is not None and right_sl is not None:
+                    dist_left = _point_to_line_dist(lx, ly, left_sl)
+                    dist_right = _point_to_line_dist(rx, ry, right_sl)
+                    if dist_left > tolerance or dist_right > tolerance:
+                        print(f"    [Service] Rejected: sideline dist L={dist_left:.1f} R={dist_right:.1f} "
+                              f"(tol={tolerance:.1f})")
+                        sideline_ok = False
+                elif left_sl is not None:
+                    dist_left = _point_to_line_dist(lx, ly, left_sl)
+                    if dist_left > tolerance:
+                        print(f"    [Service] Rejected: left sideline dist={dist_left:.1f} "
+                              f"(tol={tolerance:.1f})")
+                        sideline_ok = False
+                elif right_sl is not None:
+                    dist_right = _point_to_line_dist(rx, ry, right_sl)
+                    if dist_right > tolerance:
+                        print(f"    [Service] Rejected: right sideline dist={dist_right:.1f} "
+                              f"(tol={tolerance:.1f})")
+                        sideline_ok = False
+
+                if not sideline_ok:
+                    continue
+
+            service_candidates.append((y_at_cx, length, seg))
+
+        if service_candidates:
+            # Constraint 5: Pick closest to expected y-position, NOT longest
+            service_candidates.sort(key=lambda c: abs(c[0] - expected_y))
+            result["near_service"] = service_candidates[0][2]
+            print(f"    [Service] Selected: y={service_candidates[0][0]:.0f} "
+                  f"(expected={expected_y:.0f}, "
+                  f"y_ratio={(bl_y - service_candidates[0][0]) / bl_y:.2f})")
 
     return result
 
@@ -1240,14 +1397,7 @@ def compute_near_half_keypoints(
                   f"{len(synth)} keypoints synthesized")
             kps.extend(synth)
 
-    # near_service × center_service → KP13
-    kp13 = _intersect("near_service", "center_service")
-    assigned_ids = {k for k, _ in kps}
-    if kp13 is not None and 13 not in assigned_ids:
-        kps.append((13, kp13))
-
-    # Fallback: if KP10 and KP11 are both detected but KP13 is not, compute
-    # KP13 as the point on the near_service line at the x-midpoint of KP10/KP11
+    # KP13: midpoint of KP10/KP11 on the service line
     assigned_ids = {k for k, _ in kps}
     if 13 not in assigned_ids and 10 in assigned_ids and 11 in assigned_ids:
         kp10_pt = next(p for k, p in kps if k == 10)
@@ -1351,7 +1501,6 @@ COURT_TEMPLATE_LINES = {
     "left_doubles":    ((-5.485, 11.885), (-5.485, 6.4)),
     "right_doubles":   ((5.485, 11.885), (5.485, 6.4)),
     "near_service":    ((-4.115, 6.4), (4.115, 6.4)),
-    "center_service":  ((0.0, 11.885), (0.0, 6.4)),
 }
 
 
@@ -1626,11 +1775,21 @@ def draw_pipeline_stages(
     cv2.putText(p2, "2. Near-half crop", (5, 20),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
 
-    # Panel 3: Court color mask
-    p3 = resize(court_color_mask)
+    # Panel 3: All raw Hough lines on near-half (for debugging)
+    p3 = near_half.copy()
+    for seg in horizontal:
+        cv2.line(p3, (seg[0], seg[1]), (seg[2], seg[3]), (255, 100, 0), 2)
+    for seg in vertical:
+        cv2.line(p3, (seg[0], seg[1]), (seg[2], seg[3]), (0, 0, 255), 2)
+    p3 = resize(p3)
     ch, cs, cv_val = court_color_hsv
-    mode_label = "MULTI" if court_mode == "multi" else "SINGLE"
-    cv2.putText(p3, f"3. Court mask [{mode_label}] H={ch} S={cs} V={cv_val}", (5, 20),
+    if court_mode == "multi":
+        mode_label = "MULTI"
+    elif court_mode == "local_contrast":
+        mode_label = "LOCAL"
+    else:
+        mode_label = "SINGLE"
+    cv2.putText(p3, f"3. Raw Hough [{mode_label}] {len(horizontal)}H+{len(vertical)}V", (5, 20),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1)
 
     # Panel 4: Line filter mask
@@ -1638,19 +1797,13 @@ def draw_pipeline_stages(
     cv2.putText(p4, "4. Agrawal line mask", (5, 20),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
 
-    # Panel 5: Detected + classified lines on near-half
+    # Panel 5: Identified court lines only (no raw segments)
     p5 = near_half.copy()
-    for seg in horizontal:
-        cv2.line(p5, (seg[0], seg[1]), (seg[2], seg[3]), (255, 100, 0), 2)
-    for seg in vertical:
-        cv2.line(p5, (seg[0], seg[1]), (seg[2], seg[3]), (0, 0, 255), 2)
-    # Draw identified lines with labels
     colors = {
         "near_baseline": (0, 255, 0),
         "near_service": (0, 200, 200),
         "left_singles": (255, 0, 255),
         "right_singles": (255, 0, 255),
-        "center_service": (255, 255, 0),
         "left_doubles": (200, 200, 0),
         "right_doubles": (200, 200, 0),
     }
@@ -1663,7 +1816,7 @@ def draw_pipeline_stages(
             cv2.putText(p5, name, (mx, my - 5),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.35, c, 1)
     p5 = resize(p5)
-    cv2.putText(p5, "5. Lines classified", (5, 20),
+    cv2.putText(p5, "5. Court lines", (5, 20),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
 
     # Panel 6: Final keypoints on original frame
@@ -2042,9 +2195,6 @@ def run_agrawal_pipeline(
           f"merged ({time.time()-t4:.2f}s)")
 
     # --- Stage 4b: Multi-candidate scoring (Agrawal Section 3.4) ---
-    # Run three candidate filters through the full pipeline, score each
-    # homography by projecting court lines and counting bright-pixel overlap,
-    # then pick the best.
     t4b = time.time()
     nh_h, nh_w = near_half.shape[:2]
 
@@ -2069,22 +2219,17 @@ def run_agrawal_pipeline(
 
     candidates = []
 
-    # Candidate 1: Paper-faithful filter (simple color, no brightness gate)
-    paper_colors, paper_court_type, paper_court_mode = detect_court_color_simple(near_half, n_samples=1000)
-    paper_line_mask, paper_court_mask, _ = agrawal_paper_line_filter(near_half, paper_colors)
-    c1 = _run_candidate(paper_line_mask, f"Paper(H={paper_colors[0][0]})")
-    candidates.append(("paper", c1, paper_court_mask, paper_colors[0], paper_court_mode))
+    # Candidate 1: Local-contrast filter (primary — no global color thresholds)
+    lc_line_mask, lc_court_mask, _, lc_thresh_v, lc_thresh_s = agrawal_local_contrast_line_filter(near_half)
+    lc_line_px = np.count_nonzero(lc_line_mask)
+    print(f"  [Stage 2+3] LocalContrast: {lc_line_px} line pixels, "
+          f"thresh_v={lc_thresh_v}, thresh_s={lc_thresh_s}")
+    c1 = _run_candidate(lc_line_mask, "LocalContrast")
+    candidates.append(("local_contrast", c1, lc_court_mask, court_color, "local_contrast"))
 
-    # Candidate 2: Saturation-based (already computed above in Stage 2+3)
-    c2 = _run_candidate(line_mask.copy(), "Saturation")
-    candidates.append(("saturation", c2, court_color_mask, court_color, "single"))
-
-    # Candidate 3: Hue-based K-means (original agrawal_court_line_filter)
-    kmeans_color, kmeans_court_type = detect_court_color_kmeans(near_half, n_samples=N_COLOR_SAMPLES)
-    kmeans_line_mask = agrawal_court_line_filter(near_half, kmeans_color)
-    kmeans_court_mask = build_court_color_mask(near_half, kmeans_color)
-    c3 = _run_candidate(kmeans_line_mask, f"KMeans(H={kmeans_color[0]})")
-    candidates.append(("kmeans", c3, kmeans_court_mask, kmeans_color, "single"))
+    # Candidate 2: Saturation-based filter (fallback — disabled for local-contrast-only evaluation)
+    # c2 = _run_candidate(line_mask.copy(), "Saturation")
+    # candidates.append(("saturation", c2, court_color_mask, court_color, "single"))
 
     # Pick candidate with highest score
     best_name, best_cand, best_court_mask, best_court_color, best_court_mode = max(

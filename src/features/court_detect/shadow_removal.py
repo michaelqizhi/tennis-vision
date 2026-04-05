@@ -87,6 +87,66 @@ class ShadowRemover:
         print(f"  [ShadowRemover] Model loaded on {self.device}")
 
     @staticmethod
+    def should_remove_shadows(
+        image_bgr: np.ndarray,
+        discriminability_threshold: float = 0.60,
+        min_shadow_ratio: float = 0.03,
+        max_shadow_ratio: float = 0.50,
+    ) -> tuple[bool, float, float]:
+        """Determine whether shadow removal should be applied.
+
+        Uses the Otsu discriminability score — the ratio of inter-class
+        variance to total variance of the L channel. High discriminability
+        means a real bright/dark split (shadows); low means uniform lighting.
+
+        Analysis is restricted to the central court region (middle 40% height,
+        middle 60% width) to exclude non-court areas (walls, fences, floor)
+        that would create false bimodality.
+
+        Args:
+            image_bgr: Input BGR uint8 image.
+            discriminability_threshold: Minimum score to trigger shadow removal.
+            min_shadow_ratio: Minimum fraction of shadow pixels (below = noise).
+            max_shadow_ratio: Maximum fraction of shadow pixels (above = bad threshold).
+
+        Returns:
+            (should_apply, discriminability_score, shadow_ratio)
+        """
+        h, w = image_bgr.shape[:2]
+        # Central court region — excludes walls/fences at edges and floor at bottom
+        y0, y1 = int(h * 0.15), int(h * 0.55)
+        x0, x1 = int(w * 0.20), int(w * 0.80)
+        roi = image_bgr[y0:y1, x0:x1]
+
+        lab = cv2.cvtColor(roi, cv2.COLOR_BGR2LAB)
+        l_channel = lab[:, :, 0].astype(np.float32)
+
+        thresh, mask = cv2.threshold(
+            l_channel.astype(np.uint8), 0, 255,
+            cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU,
+        )
+
+        shadow_ratio = float(np.count_nonzero(mask)) / mask.size
+        if shadow_ratio < min_shadow_ratio or shadow_ratio > max_shadow_ratio:
+            return False, 0.0, shadow_ratio
+
+        total_var = float(np.var(l_channel))
+        if total_var < 1e-6:
+            return False, 0.0, shadow_ratio
+
+        below = l_channel[l_channel <= thresh]
+        above = l_channel[l_channel > thresh]
+        w0 = len(below) / l_channel.size
+        w1 = len(above) / l_channel.size
+        mu0 = float(below.mean())
+        mu1 = float(above.mean())
+        mu_t = float(l_channel.mean())
+        inter_class_var = w0 * (mu0 - mu_t) ** 2 + w1 * (mu1 - mu_t) ** 2
+        discriminability = inter_class_var / total_var
+
+        return discriminability >= discriminability_threshold, discriminability, shadow_ratio
+
+    @staticmethod
     def _generate_shadow_mask(image_bgr: np.ndarray) -> np.ndarray:
         """Auto-generate a shadow mask using LAB colorspace thresholding.
 

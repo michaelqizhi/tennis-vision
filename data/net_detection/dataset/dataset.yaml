@@ -1,0 +1,8 @@
+# Tennis Net Detection Dataset
+path: C:/Users/micha/tennis-vision/data/net_detection/dataset
+train: train/images
+val: val/images
+test: test/images
+
+names:
+  0: tennis_net
