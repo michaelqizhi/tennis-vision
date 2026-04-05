@@ -148,10 +148,10 @@ def estimate_net_y_from_cnn(
         if yolo_result is not None:
             net_top, net_bottom = yolo_result
             # Crop at net bottom — the true half-court dividing line.
-            # Use 1.5× net height as dynamic margin: includes court surface
-            # above the net where sidelines extend, proportional to perspective.
+            # Use 0.3× net height as small margin: just enough for the
+            # service line area at the net, without including far-court pixels.
             net_height = net_bottom - net_top
-            crop_margin = int(net_height * 1.7)
+            crop_margin = int(net_height * 0.3)
             net_y = max(0, min(net_bottom, frame.shape[0] - 100))
             return net_y, result, f"yolo(top={net_top},bot={net_bottom})", crop_margin
 
@@ -276,6 +276,100 @@ def detect_court_color_kmeans(
     return court_color, court_type
 
 
+def detect_court_color_simple(
+    frame_bgr: np.ndarray,
+    n_samples: int = 1000,
+) -> tuple[list[np.ndarray], str, str]:
+    """Detect dominant court color(s) using simple mode (Agrawal Section 3.3).
+
+    Samples N random points from the center ROI, quantizes into HSV bins,
+    and returns the median HSV of the top chromatic bin(s) as the court color(s).
+
+    Returns (colors, court_type, court_mode) where:
+    - colors: list of 1 or 2 HSV arrays (the court surface colors)
+    - court_type: "blue", "green", "clay", "unknown" (based on dominant color)
+    - court_mode: "single" or "multi"
+    """
+    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+    h_img, w_img = hsv.shape[:2]
+
+    # Sample from center ROI: y=30-80%, x=25-75%
+    y_lo = int(h_img * 0.30)
+    y_hi = int(h_img * 0.80)
+    x_lo = int(w_img * 0.25)
+    x_hi = int(w_img * 0.75)
+    ys, xs = np.mgrid[y_lo:y_hi, x_lo:x_hi]
+    ys = ys.ravel()
+    xs = xs.ravel()
+
+    if len(ys) == 0:
+        return [np.array([0, 0, 0], dtype=np.uint8)], "unknown", "single"
+
+    n = min(n_samples, len(ys))
+    indices = np.random.default_rng(42).choice(len(ys), size=n, replace=False)
+    sampled_hsv = hsv[ys[indices], xs[indices]]  # (n, 3)
+
+    # Quantize into bins: H→18 bins (10 each), S→5 bins (51 each), V→5 bins (51 each)
+    h_bins = np.clip(sampled_hsv[:, 0].astype(int) // 10, 0, 17)
+    s_bins = np.clip(sampled_hsv[:, 1].astype(int) // 51, 0, 4)
+    v_bins = np.clip(sampled_hsv[:, 2].astype(int) // 51, 0, 4)
+
+    # Combine into a single bin index
+    bin_ids = h_bins * 25 + s_bins * 5 + v_bins
+    counts = np.bincount(bin_ids, minlength=18 * 5 * 5)
+
+    # Find top-2 chromatic bins (median saturation > 30)
+    n_bins = len(counts)
+    chromatic_bins = []
+    for b in range(n_bins):
+        if counts[b] == 0:
+            continue
+        bin_mask = bin_ids == b
+        bin_pixels = sampled_hsv[bin_mask]
+        median_s = int(np.median(bin_pixels[:, 1]))
+        if median_s > 30:
+            chromatic_bins.append((b, int(counts[b]), bin_pixels))
+
+    # Sort chromatic bins by count descending
+    chromatic_bins.sort(key=lambda x: x[1], reverse=True)
+
+    if len(chromatic_bins) == 0:
+        return [np.array([0, 0, 0], dtype=np.uint8)], "unknown", "single"
+
+    # bin1 = most common chromatic bin
+    bin1_id, bin1_count, bin1_pixels = chromatic_bins[0]
+    color1_h = int(np.median(bin1_pixels[:, 0]))
+    color1_s = int(np.median(bin1_pixels[:, 1]))
+    color1_v = int(np.median(bin1_pixels[:, 2]))
+    color1 = np.array([color1_h, color1_s, color1_v], dtype=np.uint8)
+
+    # Determine single vs multi-color
+    colors = [color1]
+    court_mode = "single"
+    if len(chromatic_bins) >= 2:
+        bin2_id, bin2_count, bin2_pixels = chromatic_bins[1]
+        if bin2_count >= 0.25 * bin1_count:
+            color2_h = int(np.median(bin2_pixels[:, 0]))
+            color2_s = int(np.median(bin2_pixels[:, 1]))
+            color2_v = int(np.median(bin2_pixels[:, 2]))
+            color2 = np.array([color2_h, color2_s, color2_v], dtype=np.uint8)
+            colors.append(color2)
+            court_mode = "multi"
+
+    # Auto-detect court type from dominant color (same hue ranges as kmeans version)
+    court_h = color1_h
+    if 90 <= court_h <= 125:
+        court_type = "blue"
+    elif 35 <= court_h <= 85:
+        court_type = "green"
+    elif court_h <= 25 or court_h >= 170:
+        court_type = "clay"
+    else:
+        court_type = "unknown"
+
+    return colors, court_type, court_mode
+
+
 # ===================================================================
 # Stage 3: Agrawal court-line filter
 # ===================================================================
@@ -359,6 +453,43 @@ def agrawal_court_line_filter(
     return line_mask
 
 
+def agrawal_paper_line_filter(
+    frame_bgr: np.ndarray,
+    court_colors: list[np.ndarray],
+    neighborhood: int = NEIGHBORHOOD_SIZE,
+    min_court_neighbors: int = MIN_COURT_NEIGHBORS,
+    h_thresh: int = COLOR_MATCH_H_THRESH,
+    s_thresh: int = COLOR_MATCH_S_THRESH,
+    v_thresh: int = COLOR_MATCH_V_THRESH,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Paper-faithful Agrawal filter (Section 3.3): NO brightness/saturation gates.
+
+    Line pixel = NOT court-colored AND ≥4 court-colored neighbors in 7×7 window.
+    No V > 150 or S < 80 gate — matches the paper exactly.
+
+    Returns (line_mask, court_mask, hsv).
+    """
+    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+
+    # Build court-color binary mask as union of all color masks
+    court_mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+    for color in court_colors:
+        mask = build_court_color_mask(frame_bgr, color, h_thresh, s_thresh, v_thresh, precomputed_hsv=hsv)
+        court_mask = cv2.bitwise_or(court_mask, mask)
+
+    # Count court-color neighbors via convolution
+    court_01 = (court_mask > 0).astype(np.float32)
+    kernel = np.ones((neighborhood, neighborhood), dtype=np.float32)
+    neighbor_count = cv2.filter2D(court_01, cv2.CV_32F, kernel)
+
+    # Line pixel = NOT court-color AND enough court-color neighbors
+    not_court = (court_01 == 0)
+    has_neighbors = (neighbor_count >= min_court_neighbors)
+
+    line_mask = (not_court & has_neighbors).astype(np.uint8) * 255
+    return line_mask, court_mask, hsv
+
+
 def agrawal_saturation_line_filter(
     frame_bgr: np.ndarray,
     neighborhood: int = NEIGHBORHOOD_SIZE,
@@ -368,7 +499,7 @@ def agrawal_saturation_line_filter(
     sat_line_v_min: int = SAT_LINE_V_MIN,
     tophat_ksize: int = TOPHAT_KERNEL_SIZE,
     tophat_thresh: int = TOPHAT_THRESHOLD,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
     """Color-agnostic Agrawal filter using white top-hat + saturation gate.
 
     White top-hat on V channel extracts only thin bright features (lines),
@@ -391,8 +522,21 @@ def agrawal_saturation_line_filter(
                                              (tophat_ksize, tophat_ksize))
     tophat = cv2.morphologyEx(V, cv2.MORPH_TOPHAT, kernel_morph)
 
+    # Adaptive top-hat threshold using Otsu on court-region top-hat values.
+    # This handles both bright courts (low top-hat response ~6) and dark
+    # courts (high top-hat response ~100) without a fixed threshold.
+    court_region = (S > sat_court_thresh)
+    tophat_court = tophat[court_region]
+    if len(tophat_court) > 100:
+        otsu_thresh, _ = cv2.threshold(tophat_court, 0, 255,
+                                        cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        # Use the higher of Otsu and a minimum floor to avoid noise
+        effective_tophat_thresh = max(int(otsu_thresh * 0.7), 5)
+    else:
+        effective_tophat_thresh = tophat_thresh
+
     # Line candidate: strong top-hat response AND achromatic AND bright
-    line_candidate = ((tophat > tophat_thresh) &
+    line_candidate = ((tophat > effective_tophat_thresh) &
                       (S < sat_line_s_max) &
                       (V > sat_line_v_min))
 
@@ -406,7 +550,7 @@ def agrawal_saturation_line_filter(
     has_neighbors = (neighbor_count >= min_court_neighbors)
 
     line_mask = (line_candidate & has_neighbors).astype(np.uint8) * 255
-    return line_mask, court_mask, hsv
+    return line_mask, court_mask, hsv, effective_tophat_thresh
 
 
 # ===================================================================
@@ -562,59 +706,73 @@ def merge_collinear_segments(
     return merged
 
 
-def _find_baseline_segment(
+def _find_baseline_extent(
     lines: np.ndarray | None,
     frame_height: int,
     frame_width: int,
-) -> np.ndarray | None:
-    """Find the baseline: longest near-horizontal line in the bottom half.
+) -> tuple[int, int] | None:
+    """Find the court's horizontal extent from baseline-region H lines.
 
-    The baseline is the most reliably detected court feature — it's the
-    longest, highest-contrast horizontal line and always appears near the
-    bottom of the near-half crop.
+    Instead of using a single Hough segment (which may be partial),
+    collects ALL near-horizontal segments in the baseline region and
+    takes their full x-extent. This handles cases where Hough breaks
+    the baseline into 2-3 shorter segments.
+
+    Returns (x_left, x_right) or None if no baseline found.
     """
     if lines is None:
         return None
 
-    candidates = []
+    # Collect all H segments in the bottom portion of the crop
+    h_segs = []
     for line in lines:
         seg = line[0] if line.ndim == 2 else line
         x1, y1, x2, y2 = seg
         angle = abs(np.degrees(np.arctan2(y2 - y1, x2 - x1))) % 180
-        length = np.hypot(x2 - x1, y2 - y1)
         avg_y = (y1 + y2) / 2.0
+        length = np.hypot(x2 - x1, y2 - y1)
 
         is_horizontal = angle < 15 or angle > 165
         is_bottom = avg_y > frame_height * 0.45
-        is_long = length > frame_width * 0.15
+        is_long = length > frame_width * 0.10
 
         if is_horizontal and is_bottom and is_long:
-            candidates.append((length, seg.copy()))
+            h_segs.append(seg.copy())
 
-    if not candidates:
+    if not h_segs:
         return None
 
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    return candidates[0][1]
+    # Find the longest segment to anchor the baseline y-position
+    longest = max(h_segs, key=lambda s: np.hypot(s[2]-s[0], s[3]-s[1]))
+    baseline_y = (longest[1] + longest[3]) / 2.0
+
+    # Collect all H segments near the same y-level (within ±30px)
+    near_baseline = []
+    for seg in h_segs:
+        seg_y = (seg[1] + seg[3]) / 2.0
+        if abs(seg_y - baseline_y) < 30:
+            near_baseline.append(seg)
+
+    # Full x-extent across all co-linear baseline segments
+    x_left = min(min(s[0], s[2]) for s in near_baseline)
+    x_right = max(max(s[0], s[2]) for s in near_baseline)
+
+    return int(x_left), int(x_right)
 
 
 def create_court_spatial_mask(
-    baseline: np.ndarray,
+    baseline_extent: tuple[int, int],
     frame_height: int,
     frame_width: int,
     margin_ratio: float = 0.05,
 ) -> np.ndarray:
     """Create a spatial mask covering the court's horizontal extent.
 
-    Uses the baseline segment endpoints (which correspond to the doubles
-    sideline intersections) to define the court's lateral bounds. Pixels
-    outside these bounds are zeroed, eliminating surround noise (green
-    areas, fences, equipment) that creates false vertical lines.
-
-    A small margin is added to avoid clipping lines at the court boundary.
+    Uses the baseline x-extent (from merged horizontal segments) to define
+    the court's lateral bounds. Pixels outside these bounds are zeroed,
+    eliminating surround noise that creates false vertical lines.
     """
-    bl_x_left = min(baseline[0], baseline[2])
-    bl_x_right = max(baseline[0], baseline[2])
+    bl_x_left, bl_x_right = baseline_extent
     bl_span = bl_x_right - bl_x_left
     margin = max(int(margin_ratio * bl_span), 15)
 
@@ -650,7 +808,7 @@ def detect_lines_near_half(
       that created false V lines is spatially excluded.
     - Multi-color courts: no hue-specific logic, works on any color.
 
-    Returns (lines, baseline_segment, spatial_mask).
+    Returns (lines, baseline_extent, spatial_mask).
     """
     h, w = line_mask.shape[:2]
 
@@ -661,7 +819,7 @@ def detect_lines_near_half(
     kernel_close = np.ones((3, 3), np.uint8)
     cleaned = cv2.morphologyEx(line_mask, cv2.MORPH_CLOSE, kernel_close, iterations=1)
 
-    # --- Pass 1: Find the baseline ---
+    # --- Pass 1: Find the baseline extent ---
     pass1_lines = cv2.HoughLinesP(
         cleaned, 1, np.pi / 180,
         threshold=hough_threshold,
@@ -669,14 +827,14 @@ def detect_lines_near_half(
         maxLineGap=max_gap,
     )
 
-    baseline = _find_baseline_segment(pass1_lines, h, w)
+    baseline_extent = _find_baseline_extent(pass1_lines, h, w)
 
-    if baseline is None:
+    if baseline_extent is None:
         # No baseline found — fall back to unmasked detection
         return pass1_lines, None, None
 
-    # --- Create spatial mask from baseline endpoints ---
-    spatial_mask = create_court_spatial_mask(baseline, h, w)
+    # --- Create spatial mask from baseline extent ---
+    spatial_mask = create_court_spatial_mask(baseline_extent, h, w)
 
     # --- Pass 2: Masked Hough for all lines ---
     masked = cv2.bitwise_and(cleaned, spatial_mask)
@@ -688,7 +846,7 @@ def detect_lines_near_half(
         maxLineGap=max_gap,
     )
 
-    return pass2_lines, baseline, spatial_mask
+    return pass2_lines, baseline_extent, spatial_mask
 
 
 # ===================================================================
@@ -1444,6 +1602,7 @@ def draw_pipeline_stages(
     H_full: np.ndarray | None,
     y_offset: int,
     cnn_kps: list[tuple[float | None, float | None]] | None = None,
+    court_mode: str = "single",
 ) -> np.ndarray:
     """Create 2×3 diagnostic composite."""
     cell_w, cell_h = 640, 360
@@ -1460,23 +1619,24 @@ def draw_pipeline_stages(
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
     p1 = resize(p1)
     cv2.putText(p1, "1. Original + net", (5, 20),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
 
     # Panel 2: Near-half crop
     p2 = resize(near_half)
     cv2.putText(p2, "2. Near-half crop", (5, 20),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
 
     # Panel 3: Court color mask
     p3 = resize(court_color_mask)
     ch, cs, cv_val = court_color_hsv
-    cv2.putText(p3, f"3. Court mask H={ch} S={cs} V={cv_val}", (5, 20),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+    mode_label = "MULTI" if court_mode == "multi" else "SINGLE"
+    cv2.putText(p3, f"3. Court mask [{mode_label}] H={ch} S={cs} V={cv_val}", (5, 20),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1)
 
     # Panel 4: Line filter mask
     p4 = resize(line_mask)
     cv2.putText(p4, "4. Agrawal line mask", (5, 20),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
 
     # Panel 5: Detected + classified lines on near-half
     p5 = near_half.copy()
@@ -1504,7 +1664,7 @@ def draw_pipeline_stages(
                         cv2.FONT_HERSHEY_SIMPLEX, 0.35, c, 1)
     p5 = resize(p5)
     cv2.putText(p5, "5. Lines classified", (5, 20),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
 
     # Panel 6: Final keypoints on original frame
     p6 = original_frame.copy()
@@ -1543,7 +1703,7 @@ def draw_pipeline_stages(
 
     p6 = resize(p6)
     cv2.putText(p6, "6. Keypoints (green=near, orange=far, blue=CNN)", (5, 20),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
 
     # Assemble 2×3 grid
     row1 = np.hstack([p1, p2, p3])
@@ -1707,6 +1867,90 @@ class HomographyKalmanFilter:
 
 
 # ===================================================================
+# Court detection scoring (Agrawal Section 3.4)
+# ===================================================================
+
+def score_court_detection(
+    near_half: np.ndarray,
+    H_near: np.ndarray,
+    y_offset: int = 0,
+) -> int:
+    """Score a court detection by projecting court template lines and counting
+    overlap with bright pixels in the original image (Agrawal Section 3.4).
+
+    H_near maps image pixels → court meters.  We need the inverse
+    (meters → pixels) to project template lines onto the image.
+
+    Returns score = number of projected court pixels that overlap with
+    bright/white pixels in the original frame.
+    """
+    if H_near is None:
+        return 0
+
+    nh_h, nh_w = near_half.shape[:2]
+
+    # Invert homography: pixel→meter to meter→pixel
+    try:
+        H_inv = np.linalg.inv(H_near)
+    except np.linalg.LinAlgError:
+        return 0
+
+    # Near-half court lines in meter coords (from NEAR_HALF_KPS)
+    court_lines_m = [
+        # Near baseline: KP2 → KP3
+        ((-5.485, 11.885), (5.485, 11.885)),
+        # Near service line: KP10 → KP11
+        ((-4.115, 6.4), (4.115, 6.4)),
+        # Left doubles sideline: KP2 down toward net
+        ((-5.485, 11.885), (-5.485, 0.0)),
+        # Right doubles sideline: KP3 down toward net
+        ((5.485, 11.885), (5.485, 0.0)),
+        # Left singles sideline: KP5 → KP10
+        ((-4.115, 11.885), (-4.115, 6.4)),
+        # Right singles sideline: KP7 → KP11
+        ((4.115, 11.885), (4.115, 6.4)),
+        # Center service line: KP13 toward net
+        ((0.0, 6.4), (0.0, 0.0)),
+    ]
+
+    # Draw projected court lines onto a blank mask
+    proj_mask = np.zeros((nh_h, nh_w), dtype=np.uint8)
+    n_samples_per_line = 50
+
+    for (mx1, my1), (mx2, my2) in court_lines_m:
+        ts = np.linspace(0.0, 1.0, n_samples_per_line)
+        meter_pts = np.column_stack([
+            mx1 + ts * (mx2 - mx1),
+            my1 + ts * (my2 - my1),
+        ]).reshape(-1, 1, 2).astype(np.float64)
+
+        try:
+            pixel_pts = cv2.perspectiveTransform(meter_pts, H_inv).reshape(-1, 2)
+        except cv2.error:
+            continue
+
+        # Adjust for y_offset: H_near maps full-frame pixels, but near_half
+        # is cropped starting at y_offset
+        pixel_pts[:, 1] -= y_offset
+
+        # Draw line segments between consecutive projected points
+        for i in range(len(pixel_pts) - 1):
+            pt1 = (int(round(pixel_pts[i, 0])), int(round(pixel_pts[i, 1])))
+            pt2 = (int(round(pixel_pts[i + 1, 0])), int(round(pixel_pts[i + 1, 1])))
+            cv2.line(proj_mask, pt1, pt2, 255, thickness=3)
+
+    # Create bright-pixel mask from the original near_half image
+    hsv = cv2.cvtColor(near_half, cv2.COLOR_BGR2HSV)
+    bright_mask = ((hsv[:, :, 2] > 170) & (hsv[:, :, 1] < 60)).astype(np.uint8) * 255
+
+    # Score = overlap between projected court lines and bright pixels
+    overlap = cv2.bitwise_and(proj_mask, bright_mask)
+    score = int(np.count_nonzero(overlap))
+
+    return score
+
+
+# ===================================================================
 # Main pipeline
 # ===================================================================
 
@@ -1745,7 +1989,7 @@ def run_agrawal_pipeline(
             print(f"  [Stage 1.5] Shadow removal APPLIED "
                   f"(discrim={discrim:.3f}, shadow_ratio={shadow_ratio:.2f}, "
                   f"{time.time()-t_sr:.3f}s)")
-            diag_path = OUTPUT_DIR / f"shadow_removal_frame_{frame_idx}.jpg"
+            diag_path = OUTPUT_DIR / f"shadow_removal_{VIDEO_PATH.stem}_frame_{frame_idx}.jpg"
             diag = np.hstack([near_half, near_half_sr])
             cv2.imwrite(str(diag_path), diag)
             near_half = near_half_sr
@@ -1756,7 +2000,7 @@ def run_agrawal_pipeline(
 
     # --- Stage 2+3: Saturation-based Agrawal filter (color-agnostic) ---
     t2 = time.time()
-    line_mask, court_color_mask, hsv_full = agrawal_saturation_line_filter(near_half)
+    line_mask, court_color_mask, hsv_full, eff_tophat = agrawal_saturation_line_filter(near_half)
     # Derive court_color for logging/visualization (median HSV of chromatic pixels)
     chromatic_px = hsv_full[court_color_mask > 0]
     if len(chromatic_px) > 0:
@@ -1776,15 +2020,15 @@ def run_agrawal_pipeline(
     else:
         court_type = "unknown"
     print(f"  [Stage 2+3] Saturation Agrawal: {np.count_nonzero(line_mask)} line pixels, "
+          f"tophat_thresh={eff_tophat}, "
           f"court={court_type}(H={court_h} S={court_s} V={court_v}) ({time.time()-t2:.3f}s)")
 
     # --- Stage 4: Two-pass Hough with baseline-anchored spatial masking ---
     t4 = time.time()
-    raw_lines, baseline_seg, spatial_mask = detect_lines_near_half(line_mask)
+    raw_lines, baseline_extent, spatial_mask = detect_lines_near_half(line_mask)
     n_raw = 0 if raw_lines is None else len(raw_lines)
-    if baseline_seg is not None:
-        bl_x_left = min(baseline_seg[0], baseline_seg[2])
-        bl_x_right = max(baseline_seg[0], baseline_seg[2])
+    if baseline_extent is not None:
+        bl_x_left, bl_x_right = baseline_extent
         masked_px = np.count_nonzero(cv2.bitwise_and(line_mask, spatial_mask))
         total_px = np.count_nonzero(line_mask)
         print(f"  [Stage 4] Baseline anchor: x=[{bl_x_left},{bl_x_right}], "
@@ -1797,10 +2041,76 @@ def run_agrawal_pipeline(
     print(f"  [Stage 4] Hough: {n_raw} raw → {len(horizontal)}H + {len(vertical)}V "
           f"merged ({time.time()-t4:.2f}s)")
 
-    # --- Stage 5: Identify near-half lines ---
-    t5 = time.time()
+    # --- Stage 4b: Multi-candidate scoring (Agrawal Section 3.4) ---
+    # Run three candidate filters through the full pipeline, score each
+    # homography by projecting court lines and counting bright-pixel overlap,
+    # then pick the best.
+    t4b = time.time()
     nh_h, nh_w = near_half.shape[:2]
-    identified = identify_near_half_lines(horizontal, vertical, nh_h, nh_w)
+
+    # Helper: run a candidate line mask through the full pipeline to homography
+    def _run_candidate(cand_line_mask, cand_label):
+        """Returns (H_near, near_kps, identified, horizontal, vertical, raw_lines, line_mask, score)."""
+        if baseline_extent is not None:
+            cand_line_mask = cv2.bitwise_and(cand_line_mask, spatial_mask)
+        c_raw = detect_lines_near_half(cand_line_mask)[0]
+        c_h, c_v = classify_lines_courtside(c_raw)
+        c_h = merge_collinear_segments(c_h)
+        c_v = merge_collinear_segments(c_v)
+        c_identified = identify_near_half_lines(c_h, c_v, nh_h, nh_w)
+        c_near_kps = compute_near_half_keypoints(c_identified, y_offset, c_v, nh_h)
+        c_near_kps = validate_near_half_keypoints(c_near_kps)
+        c_H = compute_near_half_homography(c_near_kps)
+        c_score = score_court_detection(near_half, c_H, y_offset) if c_H is not None else 0
+        n = 0 if c_raw is None else len(c_raw)
+        print(f"  [Stage 4b] {cand_label}: {len(c_h)}H+{len(c_v)}V, "
+              f"{len(c_near_kps)} kps, score={c_score}")
+        return c_H, c_near_kps, c_identified, c_h, c_v, c_raw, cand_line_mask, c_score
+
+    candidates = []
+
+    # Candidate 1: Paper-faithful filter (simple color, no brightness gate)
+    paper_colors, paper_court_type, paper_court_mode = detect_court_color_simple(near_half, n_samples=1000)
+    paper_line_mask, paper_court_mask, _ = agrawal_paper_line_filter(near_half, paper_colors)
+    c1 = _run_candidate(paper_line_mask, f"Paper(H={paper_colors[0][0]})")
+    candidates.append(("paper", c1, paper_court_mask, paper_colors[0], paper_court_mode))
+
+    # Candidate 2: Saturation-based (already computed above in Stage 2+3)
+    c2 = _run_candidate(line_mask.copy(), "Saturation")
+    candidates.append(("saturation", c2, court_color_mask, court_color, "single"))
+
+    # Candidate 3: Hue-based K-means (original agrawal_court_line_filter)
+    kmeans_color, kmeans_court_type = detect_court_color_kmeans(near_half, n_samples=N_COLOR_SAMPLES)
+    kmeans_line_mask = agrawal_court_line_filter(near_half, kmeans_color)
+    kmeans_court_mask = build_court_color_mask(near_half, kmeans_color)
+    c3 = _run_candidate(kmeans_line_mask, f"KMeans(H={kmeans_color[0]})")
+    candidates.append(("kmeans", c3, kmeans_court_mask, kmeans_color, "single"))
+
+    # Pick candidate with highest score
+    best_name, best_cand, best_court_mask, best_court_color, best_court_mode = max(
+        candidates, key=lambda x: x[1][7])  # index 7 = score
+    best_H, best_near_kps, best_identified, best_h, best_v, best_raw, best_lm, best_score = best_cand
+
+    if best_score > 0:
+        print(f"  [Stage 4b] Winner: {best_name} (score={best_score}, mode={best_court_mode}) ({time.time()-t4b:.3f}s)")
+        horizontal, vertical = best_h, best_v
+        raw_lines = best_raw
+        n_raw = 0 if raw_lines is None else len(raw_lines)
+        line_mask = best_lm
+        court_color_mask = best_court_mask
+        court_color = best_court_color
+        winning_court_mode = best_court_mode
+        identified = best_identified
+    else:
+        # No candidate produced a valid homography — fall through with
+        # the saturation result from Stage 4 (already in horizontal/vertical)
+        print(f"  [Stage 4b] No candidate scored > 0, using saturation fallback "
+              f"({time.time()-t4b:.3f}s)")
+        identified = identify_near_half_lines(horizontal, vertical, nh_h, nh_w)
+        winning_court_mode = "single"
+
+    # --- Stage 5: Identify near-half lines (already computed in 4b) ---
+    t5 = time.time()
     id_count = sum(1 for v in identified.values() if v is not None)
     print(f"  [Stage 5] Identified {id_count}/7 court features:")
     for name, seg in identified.items():
@@ -1905,12 +2215,14 @@ def run_agrawal_pipeline(
         H_full=H_full,
         y_offset=y_offset,
         cnn_kps=cnn_kps,
+        court_mode=winning_court_mode,
     )
 
     results.update({
         "net_y": net_y,
         "court_color": court_color.tolist(),
         "court_type": court_type,
+        "court_mode": winning_court_mode,
         "n_raw_lines": n_raw,
         "n_horizontal": len(horizontal),
         "n_vertical": len(vertical),
@@ -1980,6 +2292,9 @@ def main():
     # Initialize shadow remover (optional)
     shadow_remover = ShadowRemover() if ENABLE_SHADOW_REMOVAL else None
 
+    # Derive video stem for unique output filenames
+    video_stem = VIDEO_PATH.stem
+
     # Process each frame
     all_results = []
     for idx in FRAME_INDICES:
@@ -1994,7 +2309,7 @@ def main():
             net_detector=net_detector)
 
         # Save diagnostic composite
-        out_path = OUTPUT_DIR / f"agrawal_frame_{idx}.jpg"
+        out_path = OUTPUT_DIR / f"agrawal_{video_stem}_frame_{idx}.jpg"
         cv2.imwrite(str(out_path), result["composite"])
         print(f"  Saved: {out_path}")
 
@@ -2035,7 +2350,7 @@ def main():
                 entry["metrics"][mk] = str(val)
         report.append(entry)
 
-    report_path = OUTPUT_DIR / "agrawal_report.json"
+    report_path = OUTPUT_DIR / f"agrawal_{video_stem}_report.json"
     with open(report_path, "w") as f:
         json.dump(report, f, indent=2, default=str)
     print(f"\nReport saved: {report_path}")
