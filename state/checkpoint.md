@@ -1,121 +1,88 @@
-# Checkpoint — Week 0, Sprint 5: YOLOv8-nano Player Detection & Bug Fixes
+# Checkpoint — Court Detection Pipeline (Agrawal-inspired)
 
-## Completed
+**Last updated:** 2026-04-07
 
-### Bug Fixes from Sprint 4 Feedback
+## Current Status
 
-1. **Race condition fix** (Critical #4) — All API route handlers (`status.py`, `results.py`, `jobs.py`) now use `job.snapshot()` for thread-safe reads instead of accessing job fields directly. Prevents inconsistent state (e.g., `status=processing` but `progress=1.0`).
+**27/32 valid homographies** on test set (`tests/court_detection_frames/`, 32 frames from 10 amateur courtside videos).
 
-2. **Court detection weighted centroid** (Critical #1) — Replaced HoughCircles with `cv2.moments` weighted centroid as the primary keypoint extraction method in `_postprocess_heatmap()`. HoughCircles is now a fallback only. This fixes the confidence=-1.0 issue where HoughCircles couldn't find circles in courtside footage heatmaps that are often elliptical, not circular. Same fix applied to ball tracking `postprocess()`.
+### 5 Remaining Failures
+- `vid01_recreational_1set_t2_half` — noisy mask, insufficient keypoints
+- `vid04_courtside_singles_t3_twothird` — noisy blue court, Hough overwhelmed
+- `vid05_recreational_doubles_t3_twothird` — no lines detected
+- `vid09_match_3D3t_t1_third` — insufficient keypoints
+- `vid09_match_3D3t_t3_twothird` — no lines detected
 
-3. **Stationary detection removal** (Critical #2) — Added `_remove_stationary()` method to `BallTracker`. Detections that cluster within 15px for >10 consecutive frames are removed as false positives (player positions, net posts). This directly addresses the heatmap showing two dense clusters at player positions instead of ball trajectories.
+## Pipeline Architecture (`scripts/test_agrawal_court.py`, ~2325 lines)
 
-4. **Shot count sanity cap** (Critical #3) — Both `count_shots_pixel()` and `count_shots_court()` now cap shot count at 1 shot/second × rally duration. A 60-second rally maxes out at 60 shots instead of 71+.
+8-stage classical CV pipeline for courtside amateur tennis footage:
 
-5. **Serve stats fallback wiring** (Non-critical #7) — When no homography, the pipeline now sets `total_serves = len(rallies)` and `first_serves = len(rallies)` in the `ServeStatsOut` response data, not just in the step status message.
+1. **Net detection & crop** — YOLO net detector → crop below net (near-half court)
+2. **Line mask generation** — 3 competing filters: saturation (pre-pass), LocalContrast, CLAHE
+3. **Court color detection** — HSV-based court surface color identification
+4. **Hough line detection** — Two-pass HoughLinesP with baseline-anchored spatial masking, multi-candidate scoring across filter variants
+5. **Line identification** — Classify detected lines as baseline, service line, sidelines (4 doubles + singles)
+   - **5b. Fallback service line** — Band-masked Hough with aggressive params when service line missing
+6. **Keypoint computation** — Line intersections → court keypoints
+7. **Homography** — RANSAC + edge-align refinement + extend to full court
+   - Safety revert if fallback service line breaks homography
+8. **Metrics** — Reprojection error, condition number, keypoint spread
 
-6. **Frontend lint fix** (Non-critical #5) — Changed `npm run lint` from `next lint --dir src` to `next lint`. The `--dir` flag is not valid in Next.js 16.
+### Key Parameters
+- HOUGH_THRESHOLD=30, HOUGH_MIN_LENGTH=30, HOUGH_MAX_GAP=40
+- MIN_MERGED_LENGTH=200, MIN_BASELINE_FRAC=0.70
+- Service line y-band: [0.50, 0.78] of baseline y
+- Fallback Hough: threshold=15, minLength=20, maxGap=60, angle±8°
 
-7. **Root endpoint** (Non-critical #8) — Added `GET /` that redirects to `/docs`. No longer returns 404.
+## What Was Done (chronological)
 
-8. **Pipeline type annotations** — Fixed `_run_pipeline_steps` config parameter from `object` to `Config`. Fixed `_cleanup_orphaned_uploads` parameter from `object` to `Config`.
+### Weeks 0-1 (Apr 2-4)
+- Built initial Agrawal pipeline (color-agnostic saturation filter)
+- Added ShadowFormer shadow removal with auto-gating
+- Integrated YOLO net detector for reliable net-y cropping
+- Two-pass Hough with baseline-anchored spatial masking
+- Service line geometric constraints (y-band, width≤baseline, angle)
+- Edge-alignment homography refinement optimizer
+- Oriented line kernels (6 directions, 0°-150°)
 
-9. **Dead code removal** — Removed unused `_VIDEO_MAGIC` dict from `upload.py`. Removed dead `rally_idx`/`burst_idx` locals from `serve_detector.py`.
+### Week 1 continued (Apr 5-6)
+- LocalContrast + CLAHE as competing line filter candidates
+- Multi-candidate scoring algorithm (best score wins)
+- Tight net crop (0.3× net height margin)
+- Multi-color court surface support
+- Nighttime court detection (adaptive CLAHE S-gate)
+- Merge tolerance tuning (angle_tol=8°, dist_tol=15px)
+- Baseline fragment merging for occluded baselines
+- Sideline chimera merge fixes
+- Homography chamfer-based outlier detection (experimental)
 
-10. **Dead import cleanup** — Removed unused `logging`/`logger` from `consensus.py`, `rally_boundaries.py`, `models.py`. Removed unused `cv2` from `inference_runner.py`. Removed unused `Optional` from `export.py`. Removed unused `os` from `tracknetv4_detector.py`.
-
-11. **Step numbering fix** — Pipeline step comments now count sequentially (Steps 1-6) instead of skipping Step 3.
-
-12. **Streaming frames in inference runner** — Replaced RAM-hogging `list(reader.iter_frames())` with disk-cached streaming using pickle temp file. A 10-min 1080p video no longer requires ~55GB RAM.
-
-### Sprint 5 Deliverables
-
-13. **YOLOv8-nano player detector** (`src/labeling/player_detector.py`) — Full implementation:
-    - `PlayerBox` dataclass with center, dimensions, containment, and distance-to-point methods
-    - `PlayerDetector` class wrapping ultralytics YOLOv8n for person detection
-    - Auto-downloads weights on first use; configurable confidence threshold and max players
-    - `filter_by_player_proximity()` function: rejects ball detections >N px from nearest player
-    - `serialize_player_boxes()` for JSON export
-
-14. **Player-proximity consensus filter** (`src/labeling/consensus.py`) — New `apply_player_proximity_filter()` function:
-    - Takes consensus results + per-frame player detections
-    - Rejects ball detections far from all detected players (configurable max_distance, default 200px)
-    - Returns (filtered_consensus, rejected_count) tuple
-    - Preserves no_detection frames unchanged
-
-15. **Pipeline integration** (`src/labeling/pipeline.py`) — Updated to 9-step pipeline (was 7):
-    - Step 3: Player detection (YOLOv8-nano) + proximity filtering
-    - Saves `players.json` with per-frame player bounding boxes
-    - `--no-player-filter` CLI flag to disable filtering
-    - `--player-distance` CLI flag (default 200px)
-    - Benchmark report includes player filter stats (enabled, rejected count, FP reduction %)
-
-16. **Visualization with player boxes** (`src/labeling/visualize.py`) — Updated review video:
-    - Blue rectangles for player bounding boxes
-    - Confidence label on each player box
-    - `player_detections` parameter in `generate_review_video()`
+### Week 1 final (Apr 7)
+- Removed barrel distortion fallback (never saved any frame)
+- Removed CC filtering (regressed 27→24)
+- Evaluated density gating (FAIL/PASS ranges overlap, unusable)
+- **Added fallback service line detection** — band-masked Hough using baseline geometry to predict service line y-position
+- Stage 7 safety revert when fallback breaks homography
+- Restored pipeline from git blob after accidental refactor by another agent
 
 ## Architecture Decisions
 
-- **Weighted centroid over HoughCircles** — The court keypoint heatmaps from courtside footage produce elliptical peaks, not circular. `cv2.moments` handles arbitrary blob shapes. HoughCircles is kept as a fallback for edge cases where moments fail (m00=0).
-- **Stationary cluster removal at 10 frames** — A tennis ball in play never stays in the same 15px radius for >10 frames at 30fps. This catches stationary FPs while preserving legitimate slow ball detections (lobs, drops).
-- **Player filter as consensus post-processing** — Rather than filtering individual model detections, the filter is applied to consensus results. This is simpler and catches FPs that multiple models agree on (which would be consensus but still wrong).
-- **Disk-cached frame streaming** — The inference runner now pickles frames to a temp file instead of holding them all in RAM. Each detector reads from the cache sequentially. Trades disk I/O for ~55GB RAM savings on 10-min videos.
+- **No CNN keypoint fallback** — Removed; the 27/32 rate is achieved purely through classical CV improvements
+- **No barrel distortion correction** — Never rescued any frame; removed
+- **Band-masked Hough for service line** — Uses baseline y-position (empirically validated: y_ratio 0.65-0.73, band [0.50, 0.78]) and angle (±8°) to constrain search
+- **Multi-candidate filter competition** — Run LocalContrast and CLAHE, score each, pick best. Saturation filter as pre-pass only (too conservative to win)
+- **IMAGE_DIR mode** — Load test frames from directory instead of video, Kalman disabled for independent frames
 
 ## Known Issues
 
-- **TrackNet V4 weights not yet tested on real video** — Pre-existing from Sprint 4.
-- **Florence-2 and YOLO-World not smoke-tested** — Pre-existing from Sprint 3.
-- **Player detector requires ultralytics package** — Listed in `requirements-labeling.txt` but not `requirements.txt`.
-- **Court detection still depends on model quality** — The weighted centroid fix improves keypoint extraction but can't fix fundamentally poor model predictions on very oblique camera angles.
+- Fallback service line not yet tested for rescuing the 5 failures
+- 3 brainstormed but unimplemented approaches for remaining failures:
+  1. Adaptive Hough threshold (scale with mask density) — ~5 lines
+  2. Line support verification (mask coverage scoring) — ~20 lines
+  3. Directional morphological opening — ~15 lines
 
-## File Changes
+## Next Steps
 
-### Created
-- `src/labeling/player_detector.py` — YOLOv8-nano player detector + proximity filter
-- `tests/test_sprint5.py` — 40 tests for Sprint 5
-
-### Modified
-- `src/api/routes/status.py` — Use `job.snapshot()` for thread safety
-- `src/api/routes/results.py` — Use `job.snapshot()` for thread safety
-- `src/api/routes/jobs.py` — Use `job.snapshot()` for thread safety
-- `src/api/pipeline.py` — Config type fix, step numbering, serve stats fallback, import fix
-- `src/api/main.py` — Config type fix, root endpoint, import fix
-- `src/api/routes/upload.py` — Removed dead `_VIDEO_MAGIC` dict
-- `src/features/court_detect/detector.py` — Weighted centroid keypoint extraction
-- `src/features/ball_tracking/detector.py` — Weighted centroid postprocess, stationary removal
-- `src/features/rally_stats/counter.py` — Shot count max-per-second cap
-- `src/features/serve_analysis/serve_detector.py` — Removed dead locals
-- `src/labeling/consensus.py` — Added `apply_player_proximity_filter()`, removed dead imports
-- `src/labeling/pipeline.py` — 9-step pipeline with player detection, new CLI flags
-- `src/labeling/visualize.py` — Player bounding box overlay
-- `src/labeling/benchmark.py` — Player filter stats in report
-- `src/labeling/inference_runner.py` — Disk-cached streaming, removed dead cv2 import
-- `src/labeling/models.py` — Removed dead logging import
-- `src/labeling/rally_boundaries.py` — Removed dead logging import
-- `src/labeling/export.py` — Removed dead Optional import
-- `src/labeling/tracknetv4_detector.py` — Removed dead os import
-- `src/labeling/__init__.py` — Updated docstring
-- `frontend/package.json` — Fixed lint script
-
-## Test Results
-
-- 283 tests pass (7.58s) — 243 existing + 40 new
-- All imports clean
-- All 12 bug fixes verified by tests
-- Zero regressions
-
-## Next Sprint (Sprint 6 / Week 1)
-
-- Run pipeline on real test video with weighted centroid + stationary filter
-- Measure detection rate improvement vs Sprint 4 baseline
-- Test player detector on real footage
-- Multi-model benchmark with all 4 detectors
-- Ground truth annotation on test clip
-
-## Environment Notes
-
-- No new pip dependencies required for core Sprint 5 features
-- Player detector requires `ultralytics` (already in `requirements-labeling.txt`)
-- YOLOv8-nano weights auto-download on first use (~6MB)
-- CLI: `python -m src.labeling.pipeline <video_path> --output <dir>` now produces 9 output files including `players.json`
+1. Test fallback service line on the 5 failures — vid04_t3 was the primary target
+2. Implement adaptive Hough threshold for noisy masks
+3. Consider line support verification for post-Hough filtering
+4. Commit and stabilize before moving to CNN near-half keypoint detector (Phase 2)

@@ -14,19 +14,16 @@ import json
 import os
 import sys
 import time
-from itertools import product
 from pathlib import Path
 
 import cv2
 import numpy as np
-from scipy.optimize import least_squares
+from scipy.optimize import minimize
 
 # Ensure project root is on sys.path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.config import get_config
-from src.features.court_detect.detector import CourtDetector, CourtDetectionResult
 from src.features.court_detect.court_template import REFERENCE_KPS_METERS
 from src.features.court_detect.shadow_removal import ShadowRemover
 
@@ -35,13 +32,16 @@ from src.features.court_detect.shadow_removal import ShadowRemover
 # ---------------------------------------------------------------------------
 VIDEO_PATH = PROJECT_ROOT / "tests" / "fixtures" / "real_match_10min.mp4"
 OUTPUT_DIR = PROJECT_ROOT / "output"
-FRAME_INDICES = [900, 1500, 2700, 3600, 5400, 7200, 9000, 10800, 13500, 16200]
+FRAME_INDICES = [16200]
+IMAGE_DIR = PROJECT_ROOT / "tests" / "court_detection_frames"  # Set to None to use VIDEO_PATH
 FRAME_W, FRAME_H = 1920, 1080
 
 # Court geometry (ITF, meters from net center origin)
 NET_Y_METERS = 0.0
 NEAR_BASELINE_Y = 11.885
 SERVICE_LINE_Y = 6.4
+MIN_BASELINE_FRAC = 0.70  # baseline must span ≥70% of frame width
+CLASSIFY_ANGLE_TOL = 10   # degrees from baseline angle for H/V classification
 
 # Near-half keypoint indices → meter coords
 NEAR_HALF_KPS = {
@@ -72,14 +72,8 @@ KP_NAMES = [
 ]
 
 # Algorithm parameters
-N_COLOR_SAMPLES = 2000
-COLOR_MATCH_H_THRESH = 15
-COLOR_MATCH_S_THRESH = 40
-COLOR_MATCH_V_THRESH = 60
 NEIGHBORHOOD_SIZE = 7
 MIN_COURT_NEIGHBORS = 4
-LINE_V_THRESHOLD = 150
-LINE_S_THRESHOLD = 80
 
 # Saturation-based Agrawal (color-agnostic)
 # Saturation-based Agrawal (color-agnostic)
@@ -89,8 +83,9 @@ SAT_LINE_V_MIN = 150        # V > this = bright (line candidate)
 TOPHAT_KERNEL_SIZE = 23      # Morphological kernel for white top-hat (> line width ~5-15px)
 TOPHAT_THRESHOLD = 30        # Minimum top-hat response to be a line candidate
 HOUGH_THRESHOLD = 30
-HOUGH_MIN_LENGTH = 80
+HOUGH_MIN_LENGTH = 30
 HOUGH_MAX_GAP = 40
+MIN_MERGED_LENGTH = 200
 ENABLE_SHADOW_REMOVAL = True
 
 
@@ -127,51 +122,31 @@ def estimate_net_y_from_yolo(
     return y1, y2
 
 
-def estimate_net_y_from_cnn(
+def estimate_net_y(
     frame: np.ndarray,
-    court_detector: CourtDetector,
-    frame_number: int = 0,
     net_detector=None,
-) -> tuple[int, CourtDetectionResult, str]:
-    """Estimate net y-position using YOLO net detector (primary) or CNN (fallback).
+) -> tuple[int, str, int]:
+    """Estimate net y-position using YOLO net detector (primary) or heuristic fallback.
 
-    Returns (net_y, cnn_result, source, crop_margin) where:
+    Returns (net_y, source, crop_margin) where:
     - net_y: the net bottom position (crop reference)
+    - source: description of how net_y was determined
     - crop_margin: how many pixels above net_y to include in crop
     """
-    # Always run CNN for keypoints (used later in pipeline for fallback)
-    result = court_detector.detect_frame(frame, frame_number=frame_number)
-
     # Primary: YOLO net detector
     if net_detector is not None:
         yolo_result = estimate_net_y_from_yolo(frame, net_detector)
         if yolo_result is not None:
             net_top, net_bottom = yolo_result
-            # Crop at net bottom — the true half-court dividing line.
-            # Use 0.3× net height as small margin: just enough for the
-            # service line area at the net, without including far-court pixels.
             net_height = net_bottom - net_top
-            crop_margin = int(net_height * 0.3)
+            crop_margin = int(net_height * 0.1)
             net_y = max(0, min(net_bottom, frame.shape[0] - 100))
-            return net_y, result, f"yolo(top={net_top},bot={net_bottom})", crop_margin
+            return net_y, f"yolo(top={net_top},bot={net_bottom})", crop_margin
 
-    # Fallback: CNN keypoints (net_y ≈ net top, uses default margin)
-    kps = result.keypoints
-    kp12_y = kps[12][1] if len(kps) > 12 and kps[12][0] is not None else None
-    kp13_y = kps[13][1] if len(kps) > 13 and kps[13][0] is not None else None
-
-    if kp12_y is not None and kp13_y is not None:
-        net_y = int(kp12_y - 30)
-        source = "cnn_kp12_kp13"
-    elif kp12_y is not None:
-        net_y = int(kp12_y - 30)
-        source = "cnn_kp12"
-    else:
-        net_y = estimate_net_y_heuristic(frame)
-        source = "heuristic"
-
+    # Fallback: horizontal Sobel heuristic
+    net_y = estimate_net_y_heuristic(frame)
     net_y = max(0, min(net_y, frame.shape[0] - 100))
-    return net_y, result, source, 20  # default margin for CNN path
+    return net_y, "heuristic", 20
 
 
 def estimate_net_y_heuristic(frame: np.ndarray) -> int:
@@ -207,288 +182,8 @@ def crop_near_half(
 
 
 # ===================================================================
-# Stage 2: Court-color detection
+# Stage 2: Agrawal court-line filter
 # ===================================================================
-
-def detect_court_color_kmeans(
-    frame_bgr: np.ndarray,
-    roi_mask: np.ndarray | None = None,
-    n_samples: int = 2000,
-    k: int = 3,
-) -> tuple[np.ndarray, str]:
-    """Detect dominant court surface color using k-means on HSV samples.
-
-    Samples from the center of the frame to avoid the surround area.
-    Returns (court_color_hsv [H,S,V], court_type).
-    """
-    from sklearn.cluster import KMeans
-
-    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
-    h_img, w_img = hsv.shape[:2]
-
-    # Sample from the CENTER of the image (middle 50% horizontal, 40-80% vertical)
-    # to focus on the actual court surface rather than surround
-    if roi_mask is not None:
-        ys, xs = np.where(roi_mask > 0)
-    else:
-        y_lo = int(h_img * 0.30)
-        y_hi = int(h_img * 0.80)
-        x_lo = int(w_img * 0.25)
-        x_hi = int(w_img * 0.75)
-        ys, xs = np.mgrid[y_lo:y_hi, x_lo:x_hi]
-        ys = ys.ravel()
-        xs = xs.ravel()
-
-    if len(ys) == 0:
-        return np.array([0, 0, 0], dtype=np.uint8), "unknown"
-
-    # Random sample
-    n = min(n_samples, len(ys))
-    indices = np.random.default_rng(42).choice(len(ys), size=n, replace=False)
-    sampled_hsv = hsv[ys[indices], xs[indices]]  # (n, 3)
-
-    # K-means on H, S channels (ignore V for lighting robustness)
-    features = sampled_hsv[:, :2].astype(np.float32)
-    km = KMeans(n_clusters=k, random_state=42, n_init=10)
-    labels = km.fit_predict(features)
-
-    # Find largest cluster
-    counts = np.bincount(labels, minlength=k)
-    dominant = int(np.argmax(counts))
-    dominant_mask = labels == dominant
-    dominant_pixels = sampled_hsv[dominant_mask]
-
-    court_h = int(np.median(dominant_pixels[:, 0]))
-    court_s = int(np.median(dominant_pixels[:, 1]))
-    court_v = int(np.median(dominant_pixels[:, 2]))
-    court_color = np.array([court_h, court_s, court_v], dtype=np.uint8)
-
-    # Auto-detect court type
-    if 90 <= court_h <= 125:
-        court_type = "blue"
-    elif 35 <= court_h <= 85:
-        court_type = "green"
-    elif court_h <= 25 or court_h >= 170:
-        court_type = "clay"
-    else:
-        court_type = "unknown"
-
-    return court_color, court_type
-
-
-def detect_court_color_simple(
-    frame_bgr: np.ndarray,
-    n_samples: int = 1000,
-) -> tuple[list[np.ndarray], str, str]:
-    """Detect dominant court color(s) using simple mode (Agrawal Section 3.3).
-
-    Samples N random points from the center ROI, quantizes into HSV bins,
-    and returns the median HSV of the top chromatic bin(s) as the court color(s).
-
-    Returns (colors, court_type, court_mode) where:
-    - colors: list of 1 or 2 HSV arrays (the court surface colors)
-    - court_type: "blue", "green", "clay", "unknown" (based on dominant color)
-    - court_mode: "single" or "multi"
-    """
-    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
-    h_img, w_img = hsv.shape[:2]
-
-    # Sample from center ROI: y=30-80%, x=25-75%
-    y_lo = int(h_img * 0.30)
-    y_hi = int(h_img * 0.80)
-    x_lo = int(w_img * 0.25)
-    x_hi = int(w_img * 0.75)
-    ys, xs = np.mgrid[y_lo:y_hi, x_lo:x_hi]
-    ys = ys.ravel()
-    xs = xs.ravel()
-
-    if len(ys) == 0:
-        return [np.array([0, 0, 0], dtype=np.uint8)], "unknown", "single"
-
-    n = min(n_samples, len(ys))
-    indices = np.random.default_rng(42).choice(len(ys), size=n, replace=False)
-    sampled_hsv = hsv[ys[indices], xs[indices]]  # (n, 3)
-
-    # Quantize into bins: H→18 bins (10 each), S→5 bins (51 each), V→5 bins (51 each)
-    h_bins = np.clip(sampled_hsv[:, 0].astype(int) // 10, 0, 17)
-    s_bins = np.clip(sampled_hsv[:, 1].astype(int) // 51, 0, 4)
-    v_bins = np.clip(sampled_hsv[:, 2].astype(int) // 51, 0, 4)
-
-    # Combine into a single bin index
-    bin_ids = h_bins * 25 + s_bins * 5 + v_bins
-    counts = np.bincount(bin_ids, minlength=18 * 5 * 5)
-
-    # Find top-2 chromatic bins (median saturation > 30)
-    n_bins = len(counts)
-    chromatic_bins = []
-    for b in range(n_bins):
-        if counts[b] == 0:
-            continue
-        bin_mask = bin_ids == b
-        bin_pixels = sampled_hsv[bin_mask]
-        median_s = int(np.median(bin_pixels[:, 1]))
-        if median_s > 30:
-            chromatic_bins.append((b, int(counts[b]), bin_pixels))
-
-    # Sort chromatic bins by count descending
-    chromatic_bins.sort(key=lambda x: x[1], reverse=True)
-
-    if len(chromatic_bins) == 0:
-        return [np.array([0, 0, 0], dtype=np.uint8)], "unknown", "single"
-
-    # bin1 = most common chromatic bin
-    bin1_id, bin1_count, bin1_pixels = chromatic_bins[0]
-    color1_h = int(np.median(bin1_pixels[:, 0]))
-    color1_s = int(np.median(bin1_pixels[:, 1]))
-    color1_v = int(np.median(bin1_pixels[:, 2]))
-    color1 = np.array([color1_h, color1_s, color1_v], dtype=np.uint8)
-
-    # Determine single vs multi-color
-    colors = [color1]
-    court_mode = "single"
-    if len(chromatic_bins) >= 2:
-        bin2_id, bin2_count, bin2_pixels = chromatic_bins[1]
-        if bin2_count >= 0.25 * bin1_count:
-            color2_h = int(np.median(bin2_pixels[:, 0]))
-            color2_s = int(np.median(bin2_pixels[:, 1]))
-            color2_v = int(np.median(bin2_pixels[:, 2]))
-            color2 = np.array([color2_h, color2_s, color2_v], dtype=np.uint8)
-            colors.append(color2)
-            court_mode = "multi"
-
-    # Auto-detect court type from dominant color (same hue ranges as kmeans version)
-    court_h = color1_h
-    if 90 <= court_h <= 125:
-        court_type = "blue"
-    elif 35 <= court_h <= 85:
-        court_type = "green"
-    elif court_h <= 25 or court_h >= 170:
-        court_type = "clay"
-    else:
-        court_type = "unknown"
-
-    return colors, court_type, court_mode
-
-
-# ===================================================================
-# Stage 3: Agrawal court-line filter
-# ===================================================================
-
-def build_court_color_mask(
-    frame_bgr: np.ndarray,
-    court_color_hsv: np.ndarray,
-    h_thresh: int = COLOR_MATCH_H_THRESH,
-    s_thresh: int = COLOR_MATCH_S_THRESH,
-    v_thresh: int = COLOR_MATCH_V_THRESH,
-    precomputed_hsv: np.ndarray | None = None,
-) -> np.ndarray:
-    """Binary mask of pixels matching the court surface color (vectorized)."""
-    hsv = precomputed_hsv if precomputed_hsv is not None else cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
-    ch, cs, cv_val = int(court_color_hsv[0]), int(court_color_hsv[1]), int(court_color_hsv[2])
-
-    s_lo = max(0, cs - s_thresh)
-    s_hi = min(255, cs + s_thresh)
-    v_lo = max(0, cv_val - v_thresh)
-    v_hi = min(255, cv_val + v_thresh)
-
-    h_lo = ch - h_thresh
-    h_hi = ch + h_thresh
-
-    if h_lo < 0:
-        # Hue wraps around
-        mask1 = cv2.inRange(hsv, np.array([0, s_lo, v_lo]),
-                            np.array([h_hi, s_hi, v_hi]))
-        mask2 = cv2.inRange(hsv, np.array([180 + h_lo, s_lo, v_lo]),
-                            np.array([179, s_hi, v_hi]))
-        court_mask = cv2.bitwise_or(mask1, mask2)
-    elif h_hi > 179:
-        mask1 = cv2.inRange(hsv, np.array([h_lo, s_lo, v_lo]),
-                            np.array([179, s_hi, v_hi]))
-        mask2 = cv2.inRange(hsv, np.array([0, s_lo, v_lo]),
-                            np.array([h_hi - 180, s_hi, v_hi]))
-        court_mask = cv2.bitwise_or(mask1, mask2)
-    else:
-        court_mask = cv2.inRange(hsv, np.array([h_lo, s_lo, v_lo]),
-                                 np.array([h_hi, s_hi, v_hi]))
-
-    return court_mask
-
-
-def agrawal_court_line_filter(
-    frame_bgr: np.ndarray,
-    court_color_hsv: np.ndarray,
-    neighborhood: int = NEIGHBORHOOD_SIZE,
-    min_court_neighbors: int = MIN_COURT_NEIGHBORS,
-    h_thresh: int = COLOR_MATCH_H_THRESH,
-    s_thresh: int = COLOR_MATCH_S_THRESH,
-    v_thresh: int = COLOR_MATCH_V_THRESH,
-) -> np.ndarray:
-    """Agrawal's core algorithm: find pixels that are NOT court-colored
-    but are SURROUNDED by court-colored pixels (vectorized via filter2D).
-
-    Returns binary mask (255 = court line pixel).
-    """
-    # Single HSV conversion, reused for both court mask and line checks
-    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
-
-    # 1. Build court-color binary mask (reusing pre-computed HSV)
-    court_mask = build_court_color_mask(frame_bgr, court_color_hsv,
-                                        h_thresh, s_thresh, v_thresh,
-                                        precomputed_hsv=hsv)
-
-    # 2. Count court-color neighbors via convolution
-    court_01 = (court_mask > 0).astype(np.float32)
-    kernel = np.ones((neighborhood, neighborhood), dtype=np.float32)
-    neighbor_count = cv2.filter2D(court_01, cv2.CV_32F, kernel)
-
-    # 3. Court line = NOT court-color AND enough court-color neighbors
-    not_court = (court_01 == 0)
-    has_neighbors = (neighbor_count >= min_court_neighbors)
-
-    # 4. Brightness/saturation check — court lines are white/bright
-    bright = hsv[:, :, 2] > LINE_V_THRESHOLD
-    low_sat = hsv[:, :, 1] < LINE_S_THRESHOLD
-
-    line_mask = (not_court & has_neighbors & bright & low_sat).astype(np.uint8) * 255
-    return line_mask
-
-
-def agrawal_paper_line_filter(
-    frame_bgr: np.ndarray,
-    court_colors: list[np.ndarray],
-    neighborhood: int = NEIGHBORHOOD_SIZE,
-    min_court_neighbors: int = MIN_COURT_NEIGHBORS,
-    h_thresh: int = COLOR_MATCH_H_THRESH,
-    s_thresh: int = COLOR_MATCH_S_THRESH,
-    v_thresh: int = COLOR_MATCH_V_THRESH,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Paper-faithful Agrawal filter (Section 3.3): NO brightness/saturation gates.
-
-    Line pixel = NOT court-colored AND ≥4 court-colored neighbors in 7×7 window.
-    No V > 150 or S < 80 gate — matches the paper exactly.
-
-    Returns (line_mask, court_mask, hsv).
-    """
-    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
-
-    # Build court-color binary mask as union of all color masks
-    court_mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
-    for color in court_colors:
-        mask = build_court_color_mask(frame_bgr, color, h_thresh, s_thresh, v_thresh, precomputed_hsv=hsv)
-        court_mask = cv2.bitwise_or(court_mask, mask)
-
-    # Count court-color neighbors via convolution
-    court_01 = (court_mask > 0).astype(np.float32)
-    kernel = np.ones((neighborhood, neighborhood), dtype=np.float32)
-    neighbor_count = cv2.filter2D(court_01, cv2.CV_32F, kernel)
-
-    # Line pixel = NOT court-color AND enough court-color neighbors
-    not_court = (court_01 == 0)
-    has_neighbors = (neighbor_count >= min_court_neighbors)
-
-    line_mask = (not_court & has_neighbors).astype(np.uint8) * 255
-    return line_mask, court_mask, hsv
-
 
 def agrawal_saturation_line_filter(
     frame_bgr: np.ndarray,
@@ -559,11 +254,12 @@ def agrawal_local_contrast_line_filter(
     min_court_neighbors: int = MIN_COURT_NEIGHBORS,
     tophat_ksize: int = TOPHAT_KERNEL_SIZE,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, int]:
-    """Local-contrast Agrawal filter using V top-hat + S black-hat.
+    """Local-contrast Agrawal filter using oriented V top-hat + S black-hat.
 
-    Detects lines as thin features that are locally brighter (V top-hat)
-    AND locally less saturated (S black-hat) than their surroundings.
-    No global color or saturation thresholds — purely local contrast.
+    Uses oriented line kernels at multiple angles (0°-150°) instead of an
+    isotropic ellipse. This suppresses isotropic texture noise (e.g. clay
+    grain) while preserving court lines at any orientation. A 3×3 median
+    pre-blur further reduces fine texture grain.
 
     Returns (line_mask, court_mask, hsv, thresh_v, thresh_s).
     """
@@ -571,11 +267,24 @@ def agrawal_local_contrast_line_filter(
     S = hsv[:, :, 1]
     V = hsv[:, :, 2]
 
-    kernel_morph = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
-                                             (tophat_ksize, tophat_ksize))
+    # Oriented top-hat/black-hat: max response across 6 line kernel angles
+    angles = [0, 30, 60, 90, 120, 150]
+    tophat_v = np.zeros_like(V, dtype=np.float32)
+    blackhat_s = np.zeros_like(S, dtype=np.float32)
+    for angle in angles:
+        k = np.zeros((tophat_ksize, tophat_ksize), dtype=np.uint8)
+        cx, cy = tophat_ksize // 2, tophat_ksize // 2
+        half = tophat_ksize // 2
+        dx = int(round(half * np.cos(np.radians(angle))))
+        dy = int(round(half * np.sin(np.radians(angle))))
+        cv2.line(k, (cx - dx, cy - dy), (cx + dx, cy + dy), 1, 1)
+        tv = cv2.morphologyEx(V, cv2.MORPH_TOPHAT, k)
+        bs = cv2.morphologyEx(S, cv2.MORPH_BLACKHAT, k)
+        tophat_v = np.maximum(tophat_v, tv.astype(np.float32))
+        blackhat_s = np.maximum(blackhat_s, bs.astype(np.float32))
 
-    tophat_v = cv2.morphologyEx(V, cv2.MORPH_TOPHAT, kernel_morph)
-    blackhat_s = cv2.morphologyEx(S, cv2.MORPH_BLACKHAT, kernel_morph)
+    tophat_v = np.clip(tophat_v, 0, 255).astype(np.uint8)
+    blackhat_s = np.clip(blackhat_s, 0, 255).astype(np.uint8)
 
     # Adaptive thresholds via Otsu
     court_region = (V > 30)
@@ -607,6 +316,86 @@ def agrawal_local_contrast_line_filter(
     return line_mask, court_mask, hsv, thresh_v, thresh_s
 
 
+def agrawal_clahe_line_filter(
+    frame_bgr: np.ndarray,
+    neighborhood: int = NEIGHBORHOOD_SIZE,
+    min_court_neighbors: int = MIN_COURT_NEIGHBORS,
+    tophat_ksize: int = TOPHAT_KERNEL_SIZE,
+    clahe_clip: float = 3.0,
+    clahe_grid: int = 8,
+    court_s_min: int = 40,
+    line_s_max: int = SAT_LINE_S_MAX,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+    """CLAHE-enhanced Agrawal filter for low-contrast / night scenes.
+
+    Applies CLAHE to the V channel before oriented top-hat extraction,
+    amplifying local brightness contrast that floodlights and dim lighting
+    reduce.  Uses an adaptive saturation ceiling (0.95 × court S median)
+    so that lines on saturated courts (e.g. nighttime floodlit blue) are
+    not rejected for absorbing court color.  The neighbor gate checks for
+    lit pixels (V > 30) rather than chromatic pixels (S > threshold),
+    allowing sideline pixels at the court-surround boundary to pass.
+
+    Returns (line_mask, court_mask, hsv, thresh_v).
+    """
+    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+    S = hsv[:, :, 1]
+    V = hsv[:, :, 2]
+
+    # CLAHE on V: boosts local contrast so lines stand out under dim lighting
+    clahe = cv2.createCLAHE(clipLimit=clahe_clip,
+                            tileGridSize=(clahe_grid, clahe_grid))
+    V_enhanced = clahe.apply(V)
+
+    # Oriented top-hat on CLAHE-enhanced V
+    angles = [0, 30, 60, 90, 120, 150]
+    tophat_v = np.zeros_like(V, dtype=np.float32)
+    for angle in angles:
+        k = np.zeros((tophat_ksize, tophat_ksize), dtype=np.uint8)
+        cx, cy = tophat_ksize // 2, tophat_ksize // 2
+        half = tophat_ksize // 2
+        dx = int(round(half * np.cos(np.radians(angle))))
+        dy = int(round(half * np.sin(np.radians(angle))))
+        cv2.line(k, (cx - dx, cy - dy), (cx + dx, cy + dy), 1, 1)
+        tv = cv2.morphologyEx(V_enhanced, cv2.MORPH_TOPHAT, k)
+        tophat_v = np.maximum(tophat_v, tv.astype(np.float32))
+    tophat_v = np.clip(tophat_v, 0, 255).astype(np.uint8)
+
+    # Chromatic court mask: colored court surface, excludes dark backgrounds
+    court_region = (S > court_s_min)
+
+    # Adaptive threshold via Otsu on court-region top-hat values
+    tophat_court = tophat_v[court_region]
+    if len(tophat_court) > 100:
+        otsu_v, _ = cv2.threshold(tophat_court, 0, 255,
+                                   cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        thresh_v = max(int(otsu_v * 0.7), 5)
+    else:
+        thresh_v = 20
+
+    # Adaptive S gate: on saturated courts (nighttime floodlit),
+    # lines absorb court color → moderate S.  Scale threshold to court.
+    court_s_median = float(np.median(S[court_region])) if np.any(court_region) else 0
+    adaptive_s_max = max(int(court_s_median * 0.95), line_s_max)
+
+    # Line candidate: strong CLAHE top-hat AND below adaptive S ceiling
+    line_candidate = (tophat_v > thresh_v) & (S < adaptive_s_max)
+
+    court_mask = court_region.astype(np.uint8) * 255
+
+    # Neighbor logic: line must be surrounded by lit pixels (V > 30).
+    # Using brightness instead of saturation so that desaturated but
+    # well-lit surfaces (e.g. green surround) count as valid context,
+    # allowing sideline pixels at the court-surround boundary to pass.
+    lit_region = (V > 30).astype(np.float32)
+    kernel = np.ones((neighborhood, neighborhood), dtype=np.float32)
+    neighbor_count = cv2.filter2D(lit_region, cv2.CV_32F, kernel)
+    has_neighbors = (neighbor_count >= min_court_neighbors)
+
+    line_mask = (line_candidate & has_neighbors).astype(np.uint8) * 255
+    return line_mask, court_mask, hsv, thresh_v
+
+
 # ===================================================================
 # Stage 4: Hough line detection + classification (reused logic)
 # ===================================================================
@@ -614,6 +403,12 @@ def agrawal_local_contrast_line_filter(
 def _seg_angle(seg: np.ndarray) -> float:
     x1, y1, x2, y2 = seg
     return np.degrees(np.arctan2(y2 - y1, x2 - x1)) % 180
+
+
+def _angle_diff(a1: float, a2: float) -> float:
+    """Shortest angular distance between two line directions in [0, 180) space."""
+    diff = abs(a1 - a2) % 180
+    return min(diff, 180 - diff)
 
 
 def line_intersection(
@@ -631,7 +426,7 @@ def line_intersection(
     t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / denom
     ix = x1 + t * (x2 - x1)
     iy = y1 + t * (y2 - y1)
-    margin = 100
+    margin = 300
     if -margin <= ix <= w + margin and -margin <= iy <= h + margin:
         return (float(ix), float(iy))
     return None
@@ -673,8 +468,15 @@ def estimate_vanishing_point(lines: list[np.ndarray]) -> np.ndarray | None:
 
 def classify_lines_courtside(
     lines: np.ndarray | None,
+    baseline_angle: float | None = None,
 ) -> tuple[list[np.ndarray], list[np.ndarray]]:
-    """Classify lines into horizontal (baselines/service) and vertical (sidelines)."""
+    """Classify lines into horizontal (baselines/service) and vertical (sidelines).
+
+    When baseline_angle is provided or auto-detected, classifies relative to it:
+    segments within CLASSIFY_ANGLE_TOL of the baseline direction → horizontal,
+    else → vertical.  This adapts to camera perspective and avoids fixed-threshold
+    misclassification of foreshortened sidelines.
+    """
     horizontal: list[np.ndarray] = []
     vertical: list[np.ndarray] = []
     if lines is None:
@@ -682,41 +484,53 @@ def classify_lines_courtside(
 
     all_segs = [seg[0] if seg.ndim == 2 else seg for seg in lines]
 
-    h_candidates: list[np.ndarray] = []
-    steep_candidates: list[np.ndarray] = []
+    # Fallback: auto-detect baseline angle from the best near-horizontal
+    # segment.  DEPRECATED — callers should pass baseline_angle from
+    # _find_baseline_extent() via detect_lines_near_half() instead.
+    if baseline_angle is None:
+        best_score = 0
+        for seg in all_segs:
+            angle = _seg_angle(seg)
+            length = np.hypot(seg[2] - seg[0], seg[3] - seg[1])
+            horiz_dist = min(angle, 180 - angle)  # degrees from horizontal
+            if horiz_dist < 25:
+                score = length * (1.0 - horiz_dist / 25.0)
+                if score > best_score:
+                    best_score = score
+                    baseline_angle = angle
 
-    for seg in all_segs:
-        angle = _seg_angle(seg)
-        # Horizontal: within 15° of horizontal (baselines, service lines)
-        if angle < 15 or angle > 165:
-            h_candidates.append(seg)
-        # Vertical: everything else with noticeable slope (sidelines ~18-24°/156-162°)
-        elif 15 <= angle <= 165:
-            steep_candidates.append(seg)
-
-    vp = estimate_vanishing_point(steep_candidates)
-    if vp is not None:
-        for seg in steep_candidates:
-            x1, y1, x2, y2 = seg.astype(float)
-            length = max(np.hypot(x2 - x1, y2 - y1), 1e-6)
-            dist_to_vp = abs((y2 - y1) * vp[0] - (x2 - x1) * vp[1]
-                             + x2 * y1 - y2 * x1) / length
-            if dist_to_vp < 60:
+    if baseline_angle is not None:
+        for seg in all_segs:
+            angle = _seg_angle(seg)
+            if _angle_diff(angle, baseline_angle) < CLASSIFY_ANGLE_TOL:
+                horizontal.append(seg)
+            else:
                 vertical.append(seg)
     else:
-        vertical = steep_candidates
+        # No baseline detected — fall back to absolute threshold
+        for seg in all_segs:
+            angle = _seg_angle(seg)
+            if angle < 15 or angle > 165:
+                horizontal.append(seg)
+            else:
+                vertical.append(seg)
 
-    horizontal = h_candidates
     return horizontal, vertical
 
 
 def merge_collinear_segments(
     segments: list[np.ndarray],
-    angle_tol: float = 10.0,
-    dist_tol: float = 30.0,
+    angle_tol: float = 8.0,
+    dist_tol: float = 15.0,
     max_gap: float = 80.0,
 ) -> list[np.ndarray]:
-    """Merge segments that are nearly collinear and close together."""
+    """Merge segments that are nearly collinear and close together.
+
+    Uses max-endpoint distance against the longer segment's line to avoid
+    chimera merges where two lines converge locally but diverge at extremes.
+    Distance tolerance scales down as angle difference increases, rejecting
+    merges where slight angle differences compound over long spans.
+    """
     if len(segments) <= 1:
         return segments
 
@@ -736,13 +550,31 @@ def merge_collinear_segments(
             adiff = min(abs(ai - aj), 180 - abs(ai - aj))
             if adiff > angle_tol:
                 continue
-            mx = (segments[j][0] + segments[j][2]) / 2
-            my = (segments[j][1] + segments[j][3]) / 2
-            x1, y1, x2, y2 = segments[i].astype(float)
-            length = max(np.hypot(x2 - x1, y2 - y1), 1e-6)
-            perp_dist = abs((y2 - y1) * mx - (x2 - x1) * my
-                            + x2 * y1 - y2 * x1) / length
-            if perp_dist < dist_tol:
+
+            # Use the longer segment as the reference line (more stable)
+            len_i = np.hypot(segments[i][2] - segments[i][0],
+                             segments[i][3] - segments[i][1])
+            len_j = np.hypot(segments[j][2] - segments[j][0],
+                             segments[j][3] - segments[j][1])
+            if len_j > len_i:
+                ref, cand, ref_len = segments[j], segments[i], len_j
+            else:
+                ref, cand, ref_len = segments[i], segments[j], len_i
+            ref_len = max(ref_len, 1e-6)
+
+            # Perpendicular distance of BOTH candidate endpoints to ref line
+            rx1, ry1, rx2, ry2 = ref.astype(float)
+            a_coeff = ry2 - ry1
+            b_coeff = -(rx2 - rx1)
+            c_coeff = rx2 * ry1 - ry2 * rx1
+            d1 = abs(a_coeff * cand[0] + b_coeff * cand[1] + c_coeff) / ref_len
+            d2 = abs(a_coeff * cand[2] + b_coeff * cand[3] + c_coeff) / ref_len
+            max_dist = max(d1, d2)
+
+            # Adaptive tolerance: tighter when angle difference is larger
+            effective_tol = dist_tol * (1.0 - 0.7 * adiff / angle_tol)
+
+            if max_dist < effective_tol:
                 group.append(segments[j])
                 used[j] = True
 
@@ -783,34 +615,124 @@ def merge_collinear_segments(
     return merged
 
 
+def filter_short_merged(
+    segments: list[np.ndarray],
+    min_length: float = MIN_MERGED_LENGTH,
+) -> list[np.ndarray]:
+    """Discard merged segments whose total span is below *min_length* px."""
+    return [s for s in segments
+            if np.hypot(s[2] - s[0], s[3] - s[1]) >= min_length]
+
+
+def _group_h_segments_by_line(
+    segments: list[np.ndarray],
+    frame_width: int,
+    y_tol: float = 30.0,
+    slope_tol: float = 0.02,
+) -> list[dict]:
+    """Group horizontal segments into co-linear clusters.
+
+    Groups by ``y_at_cx`` (y-value at frame center-x, ±*y_tol*) and slope
+    consistency (slope difference ≤ *slope_tol*).  This prevents merging
+    watermark text fragments (random short slopes) with real baseline
+    segments (consistent angle).
+
+    Returns a list of group dicts, each containing:
+        - ``segments``: list of np.ndarray segments in the group
+        - ``x_span``: (x_left, x_right) combined extent
+        - ``y_at_cx``: centroid y at frame center-x
+        - ``n_fragments``: number of segments
+        - ``gap_ratio``: fraction of x-span NOT covered by segments
+    """
+    if not segments:
+        return []
+
+    cx = frame_width / 2.0
+
+    # Compute y_at_cx and slope for each segment
+    annotated: list[tuple[float, float, np.ndarray]] = []
+    for seg in segments:
+        y_cx = _line_y_at_x(seg, cx)
+        if y_cx is None:
+            continue
+        slope = _seg_signed_slope(seg)
+        annotated.append((y_cx, slope, seg))
+
+    if not annotated:
+        return []
+
+    annotated.sort(key=lambda a: a[0])  # sort by y_at_cx
+
+    # Build groups: same y-band AND consistent slope
+    raw_groups: list[list[tuple[float, float, np.ndarray]]] = []
+    current: list[tuple[float, float, np.ndarray]] = [annotated[0]]
+    for entry in annotated[1:]:
+        group_y = np.mean([e[0] for e in current])
+        group_slope = np.median([e[1] for e in current])
+        if abs(entry[0] - group_y) < y_tol and abs(entry[1] - group_slope) <= slope_tol:
+            current.append(entry)
+        else:
+            raw_groups.append(current)
+            current = [entry]
+    raw_groups.append(current)
+
+    # Build metadata for each group
+    results: list[dict] = []
+    for g in raw_groups:
+        segs = [e[2] for e in g]
+        x_left = float(min(min(s[0], s[2]) for s in segs))
+        x_right = float(max(max(s[0], s[2]) for s in segs))
+        x_span_width = x_right - x_left
+
+        # gap_ratio: fraction of x-span not covered by segment projections
+        covered = 0.0
+        for s in segs:
+            covered += abs(float(s[2]) - float(s[0]))
+        gap_ratio = 1.0 - min(covered / max(x_span_width, 1e-6), 1.0)
+
+        results.append({
+            "segments": segs,
+            "x_span": (x_left, x_right),
+            "y_at_cx": float(np.mean([e[0] for e in g])),
+            "n_fragments": len(segs),
+            "gap_ratio": gap_ratio,
+        })
+
+    return results
+
+
 def _find_baseline_extent(
     lines: np.ndarray | None,
     frame_height: int,
     frame_width: int,
-) -> tuple[int, int] | None:
+) -> tuple[int, int, float] | None:
     """Find the court's horizontal extent from baseline-region H lines.
 
-    Instead of using a single Hough segment (which may be partial),
-    collects ALL near-horizontal segments in the baseline region and
-    takes their full x-extent. This handles cases where Hough breaks
-    the baseline into 2-3 shorter segments.
+    Groups all near-horizontal segments in the baseline region by
+    y-position (via ``_group_h_segments_by_line``) and selects the group
+    with the widest combined x-span.  No minimum threshold — any extent
+    is useful for spatial masking.
 
-    Returns (x_left, x_right) or None if no baseline found.
+    Returns (x_left, x_right, baseline_angle_degrees) or None if no
+    baseline found.  The angle is the length-weighted average angle of
+    the best group's segments (in [0, 180) degrees).
     """
     if lines is None:
         return None
 
+    cx = frame_width / 2.0
+
     # Collect all H segments in the bottom portion of the crop
-    h_segs = []
+    h_segs: list[np.ndarray] = []
     for line in lines:
         seg = line[0] if line.ndim == 2 else line
         x1, y1, x2, y2 = seg
         angle = abs(np.degrees(np.arctan2(y2 - y1, x2 - x1))) % 180
-        avg_y = (y1 + y2) / 2.0
+        y_cx = _line_y_at_x(seg, cx)
         length = np.hypot(x2 - x1, y2 - y1)
 
         is_horizontal = angle < 15 or angle > 165
-        is_bottom = avg_y > frame_height * 0.45
+        is_bottom = (y_cx is not None and y_cx > frame_height * 0.45)
         is_long = length > frame_width * 0.10
 
         if is_horizontal and is_bottom and is_long:
@@ -819,22 +741,27 @@ def _find_baseline_extent(
     if not h_segs:
         return None
 
-    # Find the longest segment to anchor the baseline y-position
-    longest = max(h_segs, key=lambda s: np.hypot(s[2]-s[0], s[3]-s[1]))
-    baseline_y = (longest[1] + longest[3]) / 2.0
+    groups = _group_h_segments_by_line(h_segs, frame_width)
+    if not groups:
+        return None
 
-    # Collect all H segments near the same y-level (within ±30px)
-    near_baseline = []
-    for seg in h_segs:
-        seg_y = (seg[1] + seg[3]) / 2.0
-        if abs(seg_y - baseline_y) < 30:
-            near_baseline.append(seg)
+    # Select the group with the widest combined x-span
+    best = max(groups, key=lambda g: g["x_span"][1] - g["x_span"][0])
+    x_left, x_right = best["x_span"]
 
-    # Full x-extent across all co-linear baseline segments
-    x_left = min(min(s[0], s[2]) for s in near_baseline)
-    x_right = max(max(s[0], s[2]) for s in near_baseline)
+    # Compute baseline angle as length-weighted average of the group's segments
+    total_weight = 0.0
+    weighted_sin = 0.0
+    weighted_cos = 0.0
+    for seg in best["segments"]:
+        length = float(np.hypot(seg[2] - seg[0], seg[3] - seg[1]))
+        angle_rad = np.radians(_seg_angle(seg))
+        weighted_sin += length * np.sin(2 * angle_rad)
+        weighted_cos += length * np.cos(2 * angle_rad)
+        total_weight += length
+    baseline_angle = (np.degrees(np.arctan2(weighted_sin, weighted_cos)) / 2) % 180
 
-    return int(x_left), int(x_right)
+    return int(x_left), int(x_right), float(baseline_angle)
 
 
 def create_court_spatial_mask(
@@ -865,7 +792,7 @@ def detect_lines_near_half(
     hough_threshold: int = HOUGH_THRESHOLD,
     min_length: int = HOUGH_MIN_LENGTH,
     max_gap: int = HOUGH_MAX_GAP,
-) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
+) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None, float | None]:
     """Two-pass Hough detection with baseline-anchored spatial masking.
 
     Pass 1: Run Hough on the full line mask to find the baseline (the
@@ -885,14 +812,13 @@ def detect_lines_near_half(
       that created false V lines is spatially excluded.
     - Multi-color courts: no hue-specific logic, works on any color.
 
-    Returns (lines, baseline_extent, spatial_mask).
+    Returns (lines, baseline_extent, spatial_mask, baseline_angle).
+    baseline_extent is (x_left, x_right) or None.
+    baseline_angle is the dominant angle of the baseline group in degrees, or None.
     """
     h, w = line_mask.shape[:2]
 
     # Light morphological cleanup — close small gaps in line pixels.
-    # NOTE: Only CLOSE, no OPEN. The horizontal OPEN kernel (1,3) erodes
-    # thin near-vertical features (sidelines) when using the saturation-based
-    # filter. The top-hat pre-filter already provides clean output.
     kernel_close = np.ones((3, 3), np.uint8)
     cleaned = cv2.morphologyEx(line_mask, cv2.MORPH_CLOSE, kernel_close, iterations=1)
 
@@ -904,11 +830,14 @@ def detect_lines_near_half(
         maxLineGap=max_gap,
     )
 
-    baseline_extent = _find_baseline_extent(pass1_lines, h, w)
+    bl_result = _find_baseline_extent(pass1_lines, h, w)
 
-    if baseline_extent is None:
+    if bl_result is None:
         # No baseline found — fall back to unmasked detection
-        return pass1_lines, None, None
+        return pass1_lines, None, None, None
+
+    baseline_extent = (bl_result[0], bl_result[1])
+    baseline_angle = bl_result[2]
 
     # --- Create spatial mask from baseline extent ---
     spatial_mask = create_court_spatial_mask(baseline_extent, h, w)
@@ -923,7 +852,7 @@ def detect_lines_near_half(
         maxLineGap=max_gap,
     )
 
-    return pass2_lines, baseline_extent, spatial_mask
+    return pass2_lines, baseline_extent, spatial_mask, baseline_angle
 
 
 # ===================================================================
@@ -1010,151 +939,153 @@ def identify_near_half_lines(
     scored.sort(key=lambda x: x[0])  # ascending y (top first)
 
     if len(scored) >= 1:
-        # Near baseline: the bottommost wide line (highest y)
-        result["near_baseline"] = scored[-1][2]
-        bl_y = scored[-1][0]
-        baseline_seg = scored[-1][2]
+        # Group all horizontal segments and pick the bottommost group
+        # whose combined x-span meets the minimum baseline threshold.
+        h_segments = [entry[2] for entry in scored]
+        groups = _group_h_segments_by_line(h_segments, frame_width)
 
-    # --- Vertical lines (must run before service line to enable sideline constraint) ---
-    if len(vertical) >= 1:
-        ref_y = frame_height * 0.8
-        # Baseline-relative min-length: sidelines span from baseline to net,
-        # so their length ≈ bl_y. Use 0.85× for margin on partial detections.
-        # Fallback to crop_height * 0.40 if no baseline was detected.
+        min_bl_span = frame_width * MIN_BASELINE_FRAC
+        # Sort groups by y_at_cx descending (bottommost first)
+        groups.sort(key=lambda g: g["y_at_cx"], reverse=True)
+
+        baseline_seg = None
+        for g in groups:
+            x_left, x_right = g["x_span"]
+            span = x_right - x_left
+            if span >= min_bl_span:
+                # Synthesize a segment from leftmost to rightmost extent
+                # using the dominant (longest) fragment's slope
+                longest = max(g["segments"], key=lambda s: abs(float(s[2]) - float(s[0])))
+                slope = _seg_signed_slope(longest)
+                anchor_y = _line_y_at_x(longest, (x_left + x_right) / 2.0)
+                mid_x = (x_left + x_right) / 2.0
+                y_left = anchor_y + slope * (x_left - mid_x)
+                y_right = anchor_y + slope * (x_right - mid_x)
+                baseline_seg = np.array([int(x_left), int(y_left),
+                                         int(x_right), int(y_right)])
+                bl_y = _line_y_at_x(baseline_seg, cx)
+                result["near_baseline"] = baseline_seg
+                n = g["n_fragments"]
+                print(f"    [Baseline] Accepted group ({n} fragment{'s' if n > 1 else ''}): "
+                      f"xspan={span:.0f} ({span/frame_width:.0%})")
+                break
+            else:
+                print(f"    [Baseline] Rejected group: xspan={span:.0f} < {min_bl_span:.0f} "
+                      f"({span/frame_width:.0%} < {MIN_BASELINE_FRAC:.0%})")
+
+        if baseline_seg is None:
+            print(f"    [Baseline] No group spans ≥{MIN_BASELINE_FRAC:.0%} of frame")
+            result["near_baseline"] = None
+
+    # --- Vertical lines (baseline-intersection matching with court proportions) ---
+    bl = result.get("near_baseline")
+    scored_v = []
+    if len(vertical) >= 1 and bl is not None:
         if bl_y is not None:
             min_vline_length = bl_y * 0.85
         else:
             min_vline_length = frame_height * 0.40
-        scored_v = []
+
+        bl_left_x = min(bl[0], bl[2])
+        bl_right_x = max(bl[0], bl[2])
+
+        bl_span = bl_right_x - bl_left_x
+
+        # Collect verticals that intersect the baseline, with normalized position
+        candidates = []  # (t, seg) where t is normalized x along baseline
         for seg in vertical:
             length = np.hypot(seg[2] - seg[0], seg[3] - seg[1])
             if length < min_vline_length:
-                continue  # skip short fragments
+                continue
+            pt = line_intersection(bl, seg, w=FRAME_W * 2, h=FRAME_H * 2)
+            if pt is None or bl_span < 1:
+                continue
+            t = (pt[0] - bl_left_x) / bl_span
+            candidates.append((t, seg))
+            ref_y = frame_height * 0.8
             x_at_ref = _line_x_at_y(seg, ref_y)
             if x_at_ref is not None:
                 scored_v.append((x_at_ref, length, seg))
-        scored_v.sort(key=lambda x: x[0])  # left to right
+        scored_v.sort(key=lambda x: x[0])
 
-        # Separate into left group (x < center) and right group (x > center)
-        left_lines = [(x, ln, s) for x, ln, s in scored_v if x < cx]
-        right_lines = [(x, ln, s) for x, ln, s in scored_v if x >= cx]
+        # Expected normalized positions from ITF court proportions
+        expected = {
+            "left_doubles": 0.0,
+            "left_singles": 1.37 / 10.97,    # ~0.125
+            "right_singles": 1.0 - 1.37 / 10.97,  # ~0.875
+            "right_doubles": 1.0,
+        }
+        inner_tol = 0.10   # toward court center
+        outer_tol = 0.15   # toward frame edge (off-frame corners)
 
-        # Exclude center-court vertical lines from sideline groups.
-        # We don't identify the center service line — it's not needed for
-        # homography and can cause misidentification of sidelines.
-        center_tolerance = frame_width * 0.15
-        center_candidates = [(x, ln, s) for x, ln, s in scored_v
-                             if abs(x - cx) < center_tolerance]
-        center_seg = None
-        if center_candidates:
-            best = min(center_candidates, key=lambda t: abs(t[0] - cx))
-            center_seg = best[2]
-
-        # Exclude center line from sideline groups to prevent misidentification
-        if center_seg is not None:
-            left_lines = [(x, ln, s) for x, ln, s in left_lines
-                          if not np.array_equal(s, center_seg)]
-            right_lines = [(x, ln, s) for x, ln, s in right_lines
-                           if not np.array_equal(s, center_seg)]
-
-        # Assign sidelines from left and right groups
-        if len(left_lines) >= 2:
-            result["left_doubles"] = left_lines[0][2]
-            result["left_singles"] = left_lines[-1][2]
-        elif len(left_lines) == 1:
-            result["left_singles"] = left_lines[0][2]
-
-        if len(right_lines) >= 2:
-            result["right_singles"] = right_lines[0][2]
-            result["right_doubles"] = right_lines[-1][2]
-        elif len(right_lines) == 1:
-            result["right_singles"] = right_lines[0][2]
-
-        # --- Doubles sideline must intersect baseline near its endpoints ---
-        bl = result.get("near_baseline")
-        if bl is not None:
-            bl_left_x = min(bl[0], bl[2])
-            bl_right_x = max(bl[0], bl[2])
-            bl_span = bl_right_x - bl_left_x
-            margin = bl_span * 0.15
-
-            for side_name in ["left_doubles", "right_doubles"]:
-                side_seg = result.get(side_name)
-                if side_seg is None:
+        # Greedy nearest-match: doubles first (most distinct), then singles
+        # Among candidates within tolerance, prefer the one reaching closest
+        # to the top of the frame (net) — sidelines always come from the net.
+        assigned = set()
+        matched_t: dict[str, float] = {}
+        role_order = ["left_doubles", "right_doubles", "left_singles", "right_singles"]
+        for role in role_order:
+            exp_t = expected[role]
+            best_idx, best_top_y = None, float('inf')
+            for i, (t, seg) in enumerate(candidates):
+                if i in assigned:
                     continue
-                pt = line_intersection(bl, side_seg, w=FRAME_W * 2, h=FRAME_H * 2)
-                if pt is None:
-                    print(f"    [Sideline] {side_name}: no intersection with baseline, removing")
-                    result[side_name] = None
-                    continue
-                if pt[0] < bl_left_x - margin or pt[0] > bl_right_x + margin:
-                    print(f"    [Sideline] {side_name}: intersection x={pt[0]:.0f} "
-                          f"outside baseline [{bl_left_x - margin:.0f}, {bl_right_x + margin:.0f}], removing")
-                    result[side_name] = None
+                dist = abs(t - exp_t)
+                # Asymmetric tolerance: wider toward frame edges (off-frame corners)
+                is_outside = (exp_t < 0.5 and t < exp_t) or (exp_t >= 0.5 and t > exp_t)
+                tol = outer_tol if is_outside else inner_tol
+                if dist <= tol:
+                    top_y = min(seg[1], seg[3])
+                    if top_y < best_top_y:
+                        best_top_y = top_y
+                        best_idx = i
+            if best_idx is not None:
+                assigned.add(best_idx)
+                result[role] = candidates[best_idx][1]
+                matched_t[role] = candidates[best_idx][0]
+                best_t = candidates[best_idx][0]
+                print(f"    [Sideline] {role}: t={best_t:.2f} "
+                      f"(expected {exp_t:.2f}, dist={abs(best_t - exp_t):.2f})")
 
-        # --- Metric ratio constraint: disambiguate singles vs doubles ---
-        # When only 1 vertical line per side, use court proportions to decide
-        # whether they are singles or doubles sidelines.
-        bl = result.get("near_baseline")
-        only_left_singles = (result["left_singles"] is not None
-                             and result["left_doubles"] is None)
-        only_right_singles = (result["right_singles"] is not None
-                              and result["right_doubles"] is None)
+        for i, (t, seg) in enumerate(candidates):
+            if i not in assigned:
+                print(f"    [Sideline] Unmatched vertical at t={t:.2f} (no role within tolerance)")
 
-        if bl is not None and only_left_singles and only_right_singles:
-            ls = result["left_singles"]
-            rs = result["right_singles"]
-            # Intersect each vertical with baseline
-            pt_l = line_intersection(bl, ls, w=FRAME_W * 2, h=FRAME_H * 2)
-            pt_r = line_intersection(bl, rs, w=FRAME_W * 2, h=FRAME_H * 2)
-            if pt_l is not None and pt_r is not None:
-                line_sep = abs(pt_r[0] - pt_l[0])
-                # Baseline pixel length (endpoint-to-endpoint)
-                bl_len = np.hypot(bl[2] - bl[0], bl[3] - bl[1])
-                if bl_len > 0:
-                    ratio = line_sep / bl_len
-                    # ratio ≈ 1.0 → doubles lines (they meet baseline at endpoints)
-                    # ratio ≈ 0.75 (8.23/10.97) → singles lines
-                    # threshold at 0.87 to separate
-                    doubles_ratio = 1.0
-                    singles_ratio = 8.23 / 10.97  # ~0.75
-                    threshold = 0.87
-                    print(f"    [Metric] Line sep ratio = {ratio:.3f} "
-                          f"(doubles≈{doubles_ratio:.2f}, "
-                          f"singles≈{singles_ratio:.2f}, "
-                          f"threshold={threshold})")
-                    if ratio > threshold:
-                        # These are doubles lines, reclassify
-                        print(f"    [Metric] Reclassifying as DOUBLES sidelines")
-                        result["left_doubles"] = result["left_singles"]
-                        result["right_doubles"] = result["right_singles"]
-                        result["left_singles"] = None
-                        result["right_singles"] = None
-                    # else: they stay as singles (correct)
+        # --- Post-processing: reassign lone sidelines for off-frame courts ---
+        ld, ls = result["left_doubles"], result["left_singles"]
+        rd, rs = result["right_doubles"], result["right_singles"]
 
-            # Additional check: if a vertical line's intersection with baseline
-            # is within ~100px of the baseline endpoint, it's doubles
-            if result["left_doubles"] is None and result["left_singles"] is not None:
-                pt_l = line_intersection(bl, result["left_singles"],
-                                         w=FRAME_W * 2, h=FRAME_H * 2)
-                bl_left_x = min(bl[0], bl[2])
-                if pt_l is not None and abs(pt_l[0] - bl_left_x) < 100:
-                    print(f"    [Metric] Left line near baseline endpoint "
-                          f"({abs(pt_l[0] - bl_left_x):.0f}px), "
-                          f"reclassifying as doubles")
-                    result["left_doubles"] = result["left_singles"]
-                    result["left_singles"] = None
+        if ld is not None and ls is None and rd is not None and rs is not None:
+            # Both right sidelines detected, only one left → use right gap to check
+            right_gap = matched_t["right_doubles"] - matched_t["right_singles"]
+            expected_ls_t = matched_t["left_doubles"] + right_gap
+            if 0 <= expected_ls_t <= 1:
+                print(f"    [Sideline] Reassign left_doubles→left_singles: "
+                      f"companion expected at t={expected_ls_t:.2f} (in-frame but missing), "
+                      f"right gap={right_gap:.2f}")
+                result["left_singles"] = result["left_doubles"]
+                result["left_doubles"] = None
 
-            if result["right_doubles"] is None and result["right_singles"] is not None:
-                pt_r = line_intersection(bl, result["right_singles"],
-                                         w=FRAME_W * 2, h=FRAME_H * 2)
-                bl_right_x = max(bl[0], bl[2])
-                if pt_r is not None and abs(pt_r[0] - bl_right_x) < 100:
-                    print(f"    [Metric] Right line near baseline endpoint "
-                          f"({abs(pt_r[0] - bl_right_x):.0f}px), "
-                          f"reclassifying as doubles")
-                    result["right_doubles"] = result["right_singles"]
-                    result["right_singles"] = None
+        elif rd is not None and rs is None and ld is not None and ls is not None:
+            # Both left sidelines detected, only one right → use left gap to check
+            left_gap = matched_t["left_singles"] - matched_t["left_doubles"]
+            expected_rs_t = matched_t["right_doubles"] - left_gap
+            if 0 <= expected_rs_t <= 1:
+                print(f"    [Sideline] Reassign right_doubles→right_singles: "
+                      f"companion expected at t={expected_rs_t:.2f} (in-frame but missing), "
+                      f"left gap={left_gap:.2f}")
+                result["right_singles"] = result["right_doubles"]
+                result["right_doubles"] = None
+
+        # Re-check after cross-check: one sideline per side → default to singles
+        ld, ls = result["left_doubles"], result["left_singles"]
+        rd, rs = result["right_doubles"], result["right_singles"]
+        if ld is not None and ls is None and rd is not None and rs is None:
+            print(f"    [Sideline] One line per side, defaulting both to singles")
+            result["left_singles"] = result["left_doubles"]
+            result["left_doubles"] = None
+            result["right_singles"] = result["right_doubles"]
+            result["right_doubles"] = None
 
     # --- Service line (uses baseline + sidelines) ---
     if bl_y is not None and len(scored) >= 2:
@@ -1236,6 +1167,94 @@ def identify_near_half_lines(
                   f"y_ratio={(bl_y - service_candidates[0][0]) / bl_y:.2f})")
 
     return result
+
+
+# ===================================================================
+# Stage 5b: Fallback service line detection (band-masked Hough)
+# ===================================================================
+
+def fallback_service_line_detection(
+    line_mask: np.ndarray,
+    identified: dict[str, np.ndarray | None],
+    nh_h: int,
+    nh_w: int,
+) -> np.ndarray | None:
+    """Detect service line using band-masked Hough when normal pipeline misses it.
+
+    Uses the baseline's y-position and angle to constrain the search:
+    - Y-band: service line must be between 0.50 and 0.78 of baseline y
+    - Angle: within ±8° of baseline angle
+    - Aggressive Hough parameters (lower threshold, shorter min length, larger gap)
+    """
+    baseline = identified.get("near_baseline")
+    if baseline is None or identified.get("near_service") is not None:
+        return None
+
+    bl = baseline
+    bl_y = (bl[1] + bl[3]) / 2.0
+    bl_angle = np.degrees(np.arctan2(bl[3] - bl[1], bl[2] - bl[0]))
+
+    # Y-band: service line is between 50% and 78% of baseline y
+    y_min = int(bl_y * 0.22)  # top of band (22% from top = 78% down from baseline)
+    y_max = int(bl_y * 0.50)  # bottom of band (50% from top = 50% down from baseline)
+
+    if y_min >= y_max or y_max <= 0:
+        return None
+
+    # Create band mask
+    band_mask = np.zeros_like(line_mask)
+    band_mask[y_min:y_max, :] = line_mask[y_min:y_max, :]
+
+    # X-margin: exclude 5% on each side
+    x_margin = int(nh_w * 0.05)
+    if x_margin > 0:
+        band_mask[:, :x_margin] = 0
+        band_mask[:, nh_w - x_margin:] = 0
+
+    if cv2.countNonZero(band_mask) < 20:
+        return None
+
+    # Aggressive Hough parameters
+    raw_lines = cv2.HoughLinesP(
+        band_mask,
+        rho=1, theta=np.pi / 180,
+        threshold=15,
+        minLineLength=20,
+        maxLineGap=60,
+    )
+
+    if raw_lines is None:
+        return None
+
+    # Filter by angle: within ±8° of baseline
+    angle_tol = 8.0
+    candidates = []
+    for seg in raw_lines[:, 0]:
+        x1, y1, x2, y2 = seg
+        angle = np.degrees(np.arctan2(y2 - y1, x2 - x1))
+        if abs(angle - bl_angle) <= angle_tol or abs(angle - bl_angle + 180) <= angle_tol or abs(angle - bl_angle - 180) <= angle_tol:
+            candidates.append(seg)
+
+    if not candidates:
+        return None
+
+    # Merge nearby segments (generous tolerances)
+    merged = merge_collinear_segments(list(np.array(candidates)), angle_tol=8.0, dist_tol=15.0, max_gap=80.0)
+
+    # Filter by minimum merged length
+    min_length = 80
+    long_enough = []
+    for seg in merged:
+        length = np.hypot(seg[2] - seg[0], seg[3] - seg[1])
+        if length >= min_length:
+            long_enough.append(seg)
+
+    if not long_enough:
+        return None
+
+    # Pick the longest segment
+    best = max(long_enough, key=lambda s: np.hypot(s[2] - s[0], s[3] - s[1]))
+    return np.array(best, dtype=np.float64)
 
 
 # ===================================================================
@@ -1473,13 +1492,13 @@ def validate_near_half_keypoints(
 
 def compute_near_half_homography(
     near_kps: list[tuple[int, tuple[float, float]]],
-) -> np.ndarray | None:
+) -> tuple[np.ndarray | None, list[tuple[int, tuple[float, float]]]]:
     """Compute homography from near-half keypoint correspondences.
 
-    Maps image pixels → court meters.
+    Maps image pixels → court meters. Returns (H, inlier_kps).
     """
     if len(near_kps) < 4:
-        return None
+        return None, near_kps
 
     src_pts = []
     dst_pts = []
@@ -1489,140 +1508,286 @@ def compute_near_half_homography(
 
     src = np.array(src_pts, dtype=np.float64)
     dst = np.array(dst_pts, dtype=np.float64)
-    H, mask = cv2.findHomography(src, dst, cv2.RANSAC, 5.0)
-    return H
+    H, mask = cv2.findHomography(src, dst, cv2.RANSAC, 0.5)
+
+    if H is None or mask is None:
+        return None, near_kps
+
+    # Filter to inliers only
+    inlier_mask = mask.ravel().astype(bool)
+    outlier_indices = [near_kps[i][0] for i in range(len(near_kps)) if not inlier_mask[i]]
+    if outlier_indices:
+        names = [KP_NAMES[k] if k < len(KP_NAMES) else f"KP{k}" for k in outlier_indices]
+        print(f"    [RANSAC] Rejected outliers: {', '.join(f'KP{k} ({n})' for k, n in zip(outlier_indices, names))}")
+    inlier_kps = [near_kps[i] for i in range(len(near_kps)) if inlier_mask[i]]
+    print(f"    [RANSAC] Inliers: {len(inlier_kps)}/{len(near_kps)}")
+
+    return H, inlier_kps
 
 
-# Court template lines in meter-space: (name, (x1, y1), (x2, y2))
-COURT_TEMPLATE_LINES = {
-    "near_baseline":   ((-5.485, 11.885), (5.485, 11.885)),
-    "left_singles":    ((-4.115, 11.885), (-4.115, 6.4)),
-    "right_singles":   ((4.115, 11.885), (4.115, 6.4)),
-    "left_doubles":    ((-5.485, 11.885), (-5.485, 6.4)),
-    "right_doubles":   ((5.485, 11.885), (5.485, 6.4)),
-    "near_service":    ((-4.115, 6.4), (4.115, 6.4)),
+EDGE_ALIGN_LINES = {
+    "near_baseline":     ((-5.485, 11.885), (5.485, 11.885)),
+    "left_singles":      ((-4.115, 11.885), (-4.115, 6.4)),
+    "right_singles":     ((4.115, 11.885), (4.115, 6.4)),
+    "left_doubles":      ((-5.485, 11.885), (-5.485, 6.4)),
+    "right_doubles":     ((5.485, 11.885), (5.485, 6.4)),
+    "near_service":      ((-4.115, 6.4), (4.115, 6.4)),
+    "center_service":    ((0.0, 6.4), (0.0, 0.0)),
+    "left_doubles_ext":  ((-5.485, 6.4), (-5.485, 0.0)),
+    "right_doubles_ext": ((5.485, 6.4), (5.485, 0.0)),
 }
 
 
-def refine_homography_with_lines(
-    H_init: np.ndarray,
-    near_kps: list[tuple[int, tuple[float, float]]],
-    identified_lines: dict[str, np.ndarray | None],
+def compute_distance_transform(line_mask: np.ndarray) -> np.ndarray:
+    """Compute distance transform: dt[y,x] = distance to nearest white pixel."""
+    inverted = 255 - line_mask
+    dt = cv2.distanceTransform(inverted, cv2.DIST_L2, 5)
+    return dt
+
+
+def debug_per_line_chamfer(
+    H: np.ndarray,
+    line_mask: np.ndarray,
     y_offset: int,
-    line_weight: float = 0.1,
-    n_line_samples: int = 10,
-) -> np.ndarray:
-    """Refine homography using both point and line correspondences.
+    n_samples: int = 50,
+    dt_cap: float = 30.0,
+    label: str = "",
+) -> dict[str, float]:
+    """Compute and print per-line chamfer distance for debugging.
 
-    Uses scipy.optimize.least_squares to minimize combined point reprojection
-    error and line-to-line distance between detected Hough lines and projected
-    court template lines.
+    Projects each EDGE_ALIGN_LINES template line through H^-1 into pixel
+    space and measures mean distance to nearest white pixel in line_mask.
     """
-    if H_init is None or len(near_kps) < 4:
-        return H_init
-
-    # Collect point correspondences
-    src_pts = []
-    dst_pts = []
-    for kp_idx, (px, py) in near_kps:
-        src_pts.append([px, py])
-        dst_pts.append(list(REFERENCE_KPS_METERS[kp_idx]))
-    src_pts = np.array(src_pts, dtype=np.float64)
-    dst_pts = np.array(dst_pts, dtype=np.float64)
-
-    # Collect line correspondences: detected segment ↔ template line
-    line_pairs = []  # (detected_samples_px, template_line_meters)
-    for name, seg in identified_lines.items():
-        if seg is None or name not in COURT_TEMPLATE_LINES:
-            continue
-        template = COURT_TEMPLATE_LINES[name]
-        # Sample points along the detected segment (in original frame coords)
-        x1, y1, x2, y2 = seg.astype(float)
-        y1 += y_offset
-        y2 += y_offset
-        ts = np.linspace(0.0, 1.0, n_line_samples)
-        samples = np.column_stack([
-            x1 + ts * (x2 - x1),
-            y1 + ts * (y2 - y1),
-        ])
-        line_pairs.append((samples, template))
-
-    if not line_pairs:
-        return H_init
-
-    # Normalize H so H[2,2] = 1
-    h0 = H_init.flatten()[:8] / H_init[2, 2]
-
-    def _h_to_mat(h8):
-        H = np.zeros((3, 3))
-        H.flat[:8] = h8
-        H[2, 2] = 1.0
-        return H
-
-    def _project_meter_to_pixel(H, meter_pts):
-        """Project meter-space points to pixel space using H^-1."""
-        H_inv = np.linalg.inv(H)
-        pts = meter_pts.reshape(-1, 1, 2).astype(np.float64)
-        return cv2.perspectiveTransform(pts, H_inv).reshape(-1, 2)
-
-    def _point_on_line_distance(px, py, lx1, ly1, lx2, ly2):
-        """Perpendicular distance from point to line defined by two points."""
-        dx = lx2 - lx1
-        dy = ly2 - ly1
-        length = max(np.hypot(dx, dy), 1e-9)
-        return abs(dy * px - dx * py + lx2 * ly1 - ly2 * lx1) / length
-
-    def residuals(h8):
-        H = _h_to_mat(h8)
-        res = []
-
-        # Point residuals: for each KP, project meter→pixel and compare
-        try:
-            H_inv = np.linalg.inv(H)
-        except np.linalg.LinAlgError:
-            return np.full(len(near_kps) * 2 +
-                           sum(len(s) for s, _ in line_pairs), 1e6)
-
-        for i in range(len(src_pts)):
-            m_pt = dst_pts[i].reshape(1, 1, 2)
-            proj = cv2.perspectiveTransform(m_pt, H_inv).reshape(2)
-            res.append(proj[0] - src_pts[i, 0])
-            res.append(proj[1] - src_pts[i, 1])
-
-        # Line residuals: for each detected line sample point, compute
-        # perpendicular distance to the projected template line
-        for samples, (m1, m2) in line_pairs:
-            template_pts = np.array([m1, m2], dtype=np.float64)
-            try:
-                proj_line = _project_meter_to_pixel(H, template_pts)
-            except np.linalg.LinAlgError:
-                res.extend([1e6] * len(samples))
-                continue
-            lx1, ly1 = proj_line[0]
-            lx2, ly2 = proj_line[1]
-            for sx, sy in samples:
-                d = _point_on_line_distance(sx, sy, lx1, ly1, lx2, ly2)
-                res.append(d * line_weight)
-
-        return np.array(res)
+    dt = compute_distance_transform(line_mask)
+    img_h, img_w = dt.shape
 
     try:
-        result = least_squares(residuals, h0, method='lm', max_nfev=200)
-        H_refined = _h_to_mat(result.x)
+        H_inv = np.linalg.inv(H)
+    except np.linalg.LinAlgError:
+        print(f"    [{label}] H is singular, cannot compute per-line chamfer")
+        return {}
 
-        # Sanity check: refined H should not be dramatically different
-        err_init = reprojection_error(near_kps, H_init)
-        err_refined = reprojection_error(near_kps, H_refined)
-        if err_refined < err_init:
-            print(f"    [PnL] Refined H: reproj {err_init:.2f} → {err_refined:.2f}px "
-                  f"(cost {result.cost:.2f})")
-            return H_refined
-        else:
-            print(f"    [PnL] Refinement did not improve ({err_init:.2f} → {err_refined:.2f}px), "
-                  f"keeping original")
-            return H_init
-    except Exception as e:
-        print(f"    [PnL] Optimization failed: {e}")
+    results: dict[str, float] = {}
+    for name, (m1, m2) in EDGE_ALIGN_LINES.items():
+        ts = np.linspace(0.0, 1.0, n_samples)
+        meter_pts = np.column_stack([
+            m1[0] + ts * (m2[0] - m1[0]),
+            m1[1] + ts * (m2[1] - m1[1]),
+        ]).reshape(-1, 1, 2).astype(np.float64)
+
+        try:
+            pixel_pts = cv2.perspectiveTransform(meter_pts, H_inv).reshape(-1, 2)
+        except cv2.error:
+            results[name] = 999.0
+            continue
+
+        pixel_pts[:, 1] -= y_offset
+        distances = []
+        n_oob = 0
+        for px, py in pixel_pts:
+            ix, iy = int(round(px)), int(round(py))
+            if 0 <= ix < img_w and 0 <= iy < img_h:
+                distances.append(min(float(dt[iy, ix]), dt_cap))
+            else:
+                distances.append(dt_cap)
+                n_oob += 1
+        mean_d = float(np.mean(distances))
+        results[name] = mean_d
+
+        # Compute projected pixel endpoints for context
+        p1 = pixel_pts[0]
+        p2 = pixel_pts[-1]
+        oob_str = f", {n_oob}/{n_samples} OOB" if n_oob > 0 else ""
+        print(f"    [{label}] {name:20s}: chamfer={mean_d:5.1f}px  "
+              f"px=({p1[0]:6.1f},{p1[1]:6.1f})->({p2[0]:6.1f},{p2[1]:6.1f})"
+              f"{oob_str}")
+
+    total = float(np.mean(list(results.values()))) if results else 999.0
+    print(f"    [{label}] TOTAL mean chamfer = {total:.2f}px")
+    return results
+
+
+def _edge_align_cost(
+    h8: np.ndarray,
+    dt: np.ndarray,
+    template_lines: list[tuple[tuple[float,float], tuple[float,float]]],
+    y_offset: int,
+    n_samples: int = 50,
+    dt_cap: float = 30.0,
+    penalty: float = 50.0,
+    kp_pixels: np.ndarray | None = None,
+    kp_meters: np.ndarray | None = None,
+    lambda_reg: float = 0.5,
+) -> float:
+    """Compute edge-alignment cost for a candidate homography.
+    
+    Cost = mean truncated chamfer distance of projected template lines
+           to line_mask (via distance transform)
+         + lambda_reg * mean keypoint reprojection error
+    """
+    H = np.zeros((3, 3), dtype=np.float64)
+    H.flat[:8] = h8
+    H[2, 2] = 1.0
+    
+    try:
+        H_inv = np.linalg.inv(H)
+    except np.linalg.LinAlgError:
+        return 1e6
+    
+    if abs(np.linalg.det(H)) < 1e-10:
+        return 1e6
+    
+    img_h, img_w = dt.shape
+    all_distances = []
+    
+    for (mx1, my1), (mx2, my2) in template_lines:
+        ts = np.linspace(0.0, 1.0, n_samples)
+        meter_pts = np.column_stack([
+            mx1 + ts * (mx2 - mx1),
+            my1 + ts * (my2 - my1),
+        ]).reshape(-1, 1, 2).astype(np.float64)
+        
+        try:
+            pixel_pts = cv2.perspectiveTransform(meter_pts, H_inv).reshape(-1, 2)
+        except cv2.error:
+            all_distances.extend([penalty] * n_samples)
+            continue
+        
+        pixel_pts[:, 1] -= y_offset
+
+        # Bilinear interpolation on DT for smooth sub-pixel gradients
+        px_arr = pixel_pts[:, 0]
+        py_arr = pixel_pts[:, 1]
+        in_bounds = ((px_arr >= 0) & (px_arr < img_w - 1) &
+                     (py_arr >= 0) & (py_arr < img_h - 1))
+        for j in range(len(px_arr)):
+            if in_bounds[j]:
+                x, y = float(px_arr[j]), float(py_arr[j])
+                x0, y0 = int(x), int(y)
+                x1, y1 = x0 + 1, y0 + 1
+                fx, fy = x - x0, y - y0
+                d = (dt[y0, x0] * (1 - fx) * (1 - fy) +
+                     dt[y0, x1] * fx * (1 - fy) +
+                     dt[y1, x0] * (1 - fx) * fy +
+                     dt[y1, x1] * fx * fy)
+                all_distances.append(min(float(d), dt_cap))
+            else:
+                all_distances.append(penalty)
+    
+    if not all_distances:
+        return 1e6
+    
+    chamfer_cost = np.mean(all_distances)
+    
+    reg_cost = 0.0
+    if kp_pixels is not None and kp_meters is not None and lambda_reg > 0:
+        meter_pts = kp_meters.reshape(-1, 1, 2).astype(np.float64)
+        try:
+            proj = cv2.perspectiveTransform(meter_pts, H_inv).reshape(-1, 2)
+            diffs = proj - kp_pixels
+            reg_cost = np.mean(np.sqrt(np.sum(diffs**2, axis=1)))
+        except (cv2.error, np.linalg.LinAlgError):
+            reg_cost = 100.0
+    
+    return chamfer_cost + lambda_reg * reg_cost
+
+
+def refine_homography_edge_align(
+    H_init: np.ndarray,
+    line_mask: np.ndarray,
+    near_kps: list[tuple[int, tuple[float, float]]],
+    y_offset: int,
+    lambda_reg: float = 0.5,
+    n_samples: int = 50,
+    dt_cap: float = 30.0,
+    max_iter: int = 100,
+    min_init_quality: float = 25.0,
+) -> np.ndarray:
+    """Refine homography by maximizing alignment with edge/line mask.
+    
+    Uses distance transform of the local-contrast line mask as a smooth
+    cost landscape. Optimizes 8-DOF homography to minimize mean chamfer
+    distance of projected court template lines to mask pixels.
+    """
+    if H_init is None:
+        return H_init
+    
+    dt = compute_distance_transform(line_mask)
+    template_lines = list(EDGE_ALIGN_LINES.values())
+    
+    kp_pixels = np.array([[px, py] for _, (px, py) in near_kps], dtype=np.float64)
+    kp_meters = np.array([REFERENCE_KPS_METERS[idx] for idx, _ in near_kps],
+                         dtype=np.float64)
+    
+    h0 = H_init.flatten()[:8] / H_init[2, 2]
+    
+    init_cost = _edge_align_cost(
+        h0, dt, template_lines, y_offset, n_samples, dt_cap, 50.0,
+        kp_pixels, kp_meters, lambda_reg)
+
+    # Debug: show per-line chamfer and per-KP reprojection BEFORE optimization
+    print(f"    [EdgeAlign] --- BEFORE optimization (total_cost={init_cost:.2f}, "
+          f"lambda_reg={lambda_reg}) ---")
+    debug_per_line_chamfer(H_init, line_mask, y_offset, n_samples, dt_cap,
+                           label="EdgeAlign-BEFORE")
+    # Per-KP reprojection error
+    try:
+        H_inv_init = np.linalg.inv(H_init)
+        m_pts = kp_meters.reshape(-1, 1, 2).astype(np.float64)
+        proj_init = cv2.perspectiveTransform(m_pts, H_inv_init).reshape(-1, 2)
+        for i, (kp_idx, (px, py)) in enumerate(near_kps):
+            name = KP_NAMES[kp_idx] if kp_idx < len(KP_NAMES) else f"KP{kp_idx}"
+            dx = proj_init[i, 0] - px
+            dy = proj_init[i, 1] - py
+            err = np.hypot(dx, dy)
+            print(f"    [EdgeAlign-BEFORE] KP{kp_idx:2d} ({name:6s}): "
+                  f"reproj_err={err:6.1f}px  "
+                  f"(proj=({proj_init[i,0]:.1f},{proj_init[i,1]:.1f}) "
+                  f"vs det=({px:.1f},{py:.1f}))")
+    except np.linalg.LinAlgError:
+        print(f"    [EdgeAlign-BEFORE] Cannot compute KP reproj (singular H)")
+
+    if init_cost > min_init_quality:
+        print(f"    [EdgeAlign] Initial cost too high ({init_cost:.1f} > "
+              f"{min_init_quality}), skipping")
+        return H_init
+    
+    result = minimize(
+        _edge_align_cost,
+        h0,
+        args=(dt, template_lines, y_offset, n_samples, dt_cap, 50.0,
+              kp_pixels, kp_meters, lambda_reg),
+        method='L-BFGS-B',
+        options={'maxiter': max_iter, 'ftol': 1e-6, 'disp': False},
+    )
+    
+    H_refined = np.zeros((3, 3), dtype=np.float64)
+    H_refined.flat[:8] = result.x
+    H_refined[2, 2] = 1.0
+    
+    refined_cost = result.fun
+    
+    err_init = reprojection_error(near_kps, H_init)
+    err_refined = reprojection_error(near_kps, H_refined)
+
+    # Debug: show per-line chamfer AFTER optimization
+    print(f"    [EdgeAlign] --- AFTER optimization (total_cost={refined_cost:.2f}, "
+          f"iterations={result.nit}, converged={result.success}) ---")
+    debug_per_line_chamfer(H_refined, line_mask, y_offset, n_samples, dt_cap,
+                           label="EdgeAlign-AFTER")
+    
+    # When lambda_reg=0, accept purely on chamfer improvement (KPs are untrusted)
+    accept = refined_cost < init_cost
+    if lambda_reg > 0:
+        accept = accept and err_refined < err_init * 1.5
+
+    if accept:
+        print(f"    [EdgeAlign] Refined: chamfer {init_cost:.2f} → {refined_cost:.2f}px, "
+              f"reproj {err_init:.2f} → {err_refined:.2f}px")
+        return H_refined
+    else:
+        print(f"    [EdgeAlign] No improvement (chamfer {init_cost:.2f} → {refined_cost:.2f}, "
+              f"reproj {err_init:.2f} → {err_refined:.2f}), keeping original")
         return H_init
 
 
@@ -1750,7 +1915,6 @@ def draw_pipeline_stages(
     all_kps: list[tuple[int, tuple[float, float]]],
     H_full: np.ndarray | None,
     y_offset: int,
-    cnn_kps: list[tuple[float | None, float | None]] | None = None,
     court_mode: str = "single",
 ) -> np.ndarray:
     """Create 2×3 diagnostic composite."""
@@ -1761,28 +1925,23 @@ def draw_pipeline_stages(
             img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
         return cv2.resize(img, (cell_w, cell_h))
 
-    # Panel 1: Original + net line
-    p1 = original_frame.copy()
-    cv2.line(p1, (0, net_y), (FRAME_W, net_y), (0, 255, 255), 2)
-    cv2.putText(p1, f"Net y={net_y}", (10, net_y - 10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-    p1 = resize(p1)
-    cv2.putText(p1, "1. Original + net", (5, 20),
+    # Panel 1: Near-half crop
+    p1 = resize(near_half)
+    cv2.putText(p1, "1. Near-half crop", (5, 20),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
 
-    # Panel 2: Near-half crop
-    p2 = resize(near_half)
-    cv2.putText(p2, "2. Near-half crop", (5, 20),
+    # Panel 2: Line filter mask
+    p2 = resize(line_mask)
+    cv2.putText(p2, "2. Agrawal line mask", (5, 20),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
 
-    # Panel 3: All raw Hough lines on near-half (for debugging)
+    # Panel 3: All raw Hough lines on near-half
     p3 = near_half.copy()
     for seg in horizontal:
         cv2.line(p3, (seg[0], seg[1]), (seg[2], seg[3]), (255, 100, 0), 2)
     for seg in vertical:
         cv2.line(p3, (seg[0], seg[1]), (seg[2], seg[3]), (0, 0, 255), 2)
     p3 = resize(p3)
-    ch, cs, cv_val = court_color_hsv
     if court_mode == "multi":
         mode_label = "MULTI"
     elif court_mode == "local_contrast":
@@ -1792,13 +1951,8 @@ def draw_pipeline_stages(
     cv2.putText(p3, f"3. Raw Hough [{mode_label}] {len(horizontal)}H+{len(vertical)}V", (5, 20),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1)
 
-    # Panel 4: Line filter mask
-    p4 = resize(line_mask)
-    cv2.putText(p4, "4. Agrawal line mask", (5, 20),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
-
-    # Panel 5: Identified court lines only (no raw segments)
-    p5 = near_half.copy()
+    # Panel 4: Identified court lines only (no raw segments)
+    p4 = near_half.copy()
     colors = {
         "near_baseline": (0, 255, 0),
         "near_service": (0, 200, 200),
@@ -1810,13 +1964,38 @@ def draw_pipeline_stages(
     for name, seg in identified_lines.items():
         if seg is not None:
             c = colors.get(name, (255, 255, 255))
-            cv2.line(p5, (seg[0], seg[1]), (seg[2], seg[3]), c, 3)
-            mx = (seg[0] + seg[2]) // 2
-            my = (seg[1] + seg[3]) // 2
-            cv2.putText(p5, name, (mx, my - 5),
+            cv2.line(p4, (int(seg[0]), int(seg[1])), (int(seg[2]), int(seg[3])), c, 3)
+            mx = int((seg[0] + seg[2]) // 2)
+            my = int((seg[1] + seg[3]) // 2)
+            cv2.putText(p4, name, (mx, my - 5),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.35, c, 1)
-    p5 = resize(p5)
-    cv2.putText(p5, "5. Court lines", (5, 20),
+    p4 = resize(p4)
+    cv2.putText(p4, "4. Court lines", (5, 20),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+
+    # Panel 5: Edge-alignment overlay (line mask + projected template)
+    p5 = resize(line_mask)
+    if H_full is not None:
+        try:
+            H_inv = np.linalg.inv(H_full)
+            mask_h, mask_w = line_mask.shape[:2]
+            sx = cell_w / mask_w
+            sy = cell_h / mask_h
+            for (m1, m2) in EDGE_ALIGN_LINES.values():
+                ts = np.linspace(0, 1, 50)
+                pts_m = np.column_stack([
+                    m1[0] + ts*(m2[0]-m1[0]),
+                    m1[1] + ts*(m2[1]-m1[1]),
+                ]).reshape(-1,1,2).astype(np.float64)
+                pts_px = cv2.perspectiveTransform(pts_m, H_inv).reshape(-1,2)
+                pts_px[:, 1] -= y_offset
+                for i in range(len(pts_px)-1):
+                    pt1 = (int(pts_px[i,0]*sx), int(pts_px[i,1]*sy))
+                    pt2 = (int(pts_px[i+1,0]*sx), int(pts_px[i+1,1]*sy))
+                    cv2.line(p5, pt1, pt2, (0, 255, 0), 1)
+        except Exception:
+            pass
+    cv2.putText(p5, "5. Edge-align overlay", (5, 20),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
 
     # Panel 6: Final keypoints on original frame
@@ -1832,12 +2011,6 @@ def draw_pipeline_stages(
         cv2.circle(p6, (ix, iy), 6, color, -1)
         cv2.putText(p6, f"{kp_idx}", (ix + 8, iy - 4),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
-
-    # Draw CNN keypoints for comparison
-    if cnn_kps is not None:
-        for i, (cx, cy) in enumerate(cnn_kps):
-            if cx is not None and cy is not None:
-                cv2.circle(p6, (int(cx), int(cy)), 4, (255, 0, 0), -1)
 
     # Draw reprojected court outline if we have H_full
     if H_full is not None:
@@ -1855,7 +2028,7 @@ def draw_pipeline_stages(
             pass
 
     p6 = resize(p6)
-    cv2.putText(p6, "6. Keypoints (green=near, orange=far, blue=CNN)", (5, 20),
+    cv2.putText(p6, "6. Keypoints (green=near, orange=far)", (5, 20),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
 
     # Assemble 2×3 grid
@@ -1869,7 +2042,6 @@ def compute_metrics(
     near_kps: list[tuple[int, tuple[float, float]]],
     all_kps: list[tuple[int, tuple[float, float]]],
     H_full: np.ndarray | None,
-    cnn_kps: list[tuple[float | None, float | None]] | None,
 ) -> dict:
     """Compute quality metrics for the detection."""
     metrics: dict = {
@@ -1880,9 +2052,6 @@ def compute_metrics(
         "far_reprojection_error_px": float("inf"),
         "homography_condition": float("inf"),
         "keypoint_spread": 0.0,
-        "cnn_agreement_px": float("inf"),
-        "cnn_near_agreement_px": float("inf"),
-        "cnn_far_agreement_px": float("inf"),
         "homography_valid": False,
     }
 
@@ -1907,28 +2076,6 @@ def compute_metrics(
         x_range = pts[:, 0].max() - pts[:, 0].min()
         y_range = pts[:, 1].max() - pts[:, 1].min()
         metrics["keypoint_spread"] = float(x_range * y_range)
-
-    # CNN agreement — separated by near (meaningful) and far (projected)
-    if cnn_kps is not None and len(all_kps) > 0:
-        all_dists = []
-        near_dists = []
-        far_dists = []
-        for kp_idx, (px, py) in all_kps:
-            if kp_idx < len(cnn_kps):
-                cx, cy = cnn_kps[kp_idx]
-                if cx is not None and cy is not None:
-                    d = np.hypot(px - cx, py - cy)
-                    all_dists.append(d)
-                    if kp_idx in near_ids:
-                        near_dists.append(d)
-                    else:
-                        far_dists.append(d)
-        if all_dists:
-            metrics["cnn_agreement_px"] = float(np.mean(all_dists))
-        if near_dists:
-            metrics["cnn_near_agreement_px"] = float(np.mean(near_dists))
-        if far_dists:
-            metrics["cnn_far_agreement_px"] = float(np.mean(far_dists))
 
     return metrics
 
@@ -2027,6 +2174,7 @@ def score_court_detection(
     near_half: np.ndarray,
     H_near: np.ndarray,
     y_offset: int = 0,
+    line_mask: np.ndarray | None = None,
 ) -> int:
     """Score a court detection by projecting court template lines and counting
     overlap with bright pixels in the original image (Agrawal Section 3.4).
@@ -2092,13 +2240,20 @@ def score_court_detection(
             pt2 = (int(round(pixel_pts[i + 1, 0])), int(round(pixel_pts[i + 1, 1])))
             cv2.line(proj_mask, pt1, pt2, 255, thickness=3)
 
-    # Create bright-pixel mask from the original near_half image
-    hsv = cv2.cvtColor(near_half, cv2.COLOR_BGR2HSV)
-    bright_mask = ((hsv[:, :, 2] > 170) & (hsv[:, :, 1] < 60)).astype(np.uint8) * 255
+    # Create target mask for scoring
+    if line_mask is not None:
+        # Use candidate's own line mask
+        target_mask = line_mask
+    else:
+        # Fallback: hardcoded bright-pixel mask for backward compatibility
+        hsv = cv2.cvtColor(near_half, cv2.COLOR_BGR2HSV)
+        target_mask = ((hsv[:, :, 2] > 170) & (hsv[:, :, 1] < 60)).astype(np.uint8) * 255
 
-    # Score = overlap between projected court lines and bright pixels
-    overlap = cv2.bitwise_and(proj_mask, bright_mask)
-    score = int(np.count_nonzero(overlap))
+    # Score = fraction of projected court template covered by target pixels
+    # Normalized to avoid bias toward denser masks
+    overlap = cv2.bitwise_and(proj_mask, target_mask)
+    proj_total = max(np.count_nonzero(proj_mask), 1)
+    score = int(np.count_nonzero(overlap) * 10000 / proj_total)  # scale to integer
 
     return score
 
@@ -2110,7 +2265,6 @@ def score_court_detection(
 def run_agrawal_pipeline(
     frame: np.ndarray,
     frame_idx: int,
-    court_detector: CourtDetector,
     kalman: HomographyKalmanFilter | None = None,
     shadow_remover: "ShadowRemover | None" = None,
     net_detector=None,
@@ -2121,13 +2275,10 @@ def run_agrawal_pipeline(
 
     # --- Stage 1: Net detection & crop ---
     t1 = time.time()
-    net_y, cnn_result, net_source, crop_margin = estimate_net_y_from_cnn(
-        frame, court_detector, frame_idx, net_detector=net_detector)
-    cnn_kps = cnn_result.keypoints
-    cnn_detected = sum(1 for p in cnn_kps if p[0] is not None)
+    net_y, net_source, crop_margin = estimate_net_y(
+        frame, net_detector=net_detector)
     print(f"  [Stage 1] Net y={net_y} (source={net_source}), "
-          f"margin={crop_margin}, CNN detected {cnn_detected}/14 keypoints "
-          f"({time.time()-t1:.2f}s)")
+          f"margin={crop_margin} ({time.time()-t1:.2f}s)")
 
     near_half, y_offset = crop_near_half(frame, net_y, margin=crop_margin)
     print(f"  [Stage 1] Near-half crop: {near_half.shape[1]}×{near_half.shape[0]}, "
@@ -2178,8 +2329,9 @@ def run_agrawal_pipeline(
 
     # --- Stage 4: Two-pass Hough with baseline-anchored spatial masking ---
     t4 = time.time()
-    raw_lines, baseline_extent, spatial_mask = detect_lines_near_half(line_mask)
+    raw_lines, baseline_extent, spatial_mask, bl_angle = detect_lines_near_half(line_mask)
     n_raw = 0 if raw_lines is None else len(raw_lines)
+
     if baseline_extent is not None:
         bl_x_left, bl_x_right = baseline_extent
         masked_px = np.count_nonzero(cv2.bitwise_and(line_mask, spatial_mask))
@@ -2188,9 +2340,9 @@ def run_agrawal_pipeline(
               f"spatial mask kept {masked_px}/{total_px} line pixels")
     else:
         print(f"  [Stage 4] No baseline found — using unmasked detection")
-    horizontal, vertical = classify_lines_courtside(raw_lines)
-    horizontal = merge_collinear_segments(horizontal)
-    vertical = merge_collinear_segments(vertical)
+    horizontal, vertical = classify_lines_courtside(raw_lines, baseline_angle=bl_angle)
+    horizontal = filter_short_merged(merge_collinear_segments(horizontal))
+    vertical = filter_short_merged(merge_collinear_segments(vertical))
     print(f"  [Stage 4] Hough: {n_raw} raw → {len(horizontal)}H + {len(vertical)}V "
           f"merged ({time.time()-t4:.2f}s)")
 
@@ -2198,28 +2350,37 @@ def run_agrawal_pipeline(
     t4b = time.time()
     nh_h, nh_w = near_half.shape[:2]
 
-    # Helper: run a candidate line mask through the full pipeline to homography
+    # Helper: run a candidate line mask through the full pipeline to homography.
+    # Each candidate computes its own baseline extent so a weak saturation
+    # mask cannot clip a stronger local-contrast candidate.
     def _run_candidate(cand_line_mask, cand_label):
-        """Returns (H_near, near_kps, identified, horizontal, vertical, raw_lines, line_mask, score)."""
-        if baseline_extent is not None:
-            cand_line_mask = cv2.bitwise_and(cand_line_mask, spatial_mask)
-        c_raw = detect_lines_near_half(cand_line_mask)[0]
-        c_h, c_v = classify_lines_courtside(c_raw)
-        c_h = merge_collinear_segments(c_h)
-        c_v = merge_collinear_segments(c_v)
+        """Returns (H_near, near_kps, identified, horizontal, vertical, raw_lines, line_mask, score, reproj_err)."""
+        c_raw, c_bl_ext, c_sm, c_bl_angle = detect_lines_near_half(cand_line_mask)
+        if c_bl_ext is not None:
+            cand_line_mask = cv2.bitwise_and(cand_line_mask, c_sm)
+            c_raw, _, _, c_bl_angle2 = detect_lines_near_half(cand_line_mask)
+            if c_bl_angle2 is not None:
+                c_bl_angle = c_bl_angle2
+            bl_span = c_bl_ext[1] - c_bl_ext[0]
+            print(f"  [Stage 4b] {cand_label}: baseline x=[{c_bl_ext[0]},{c_bl_ext[1]}], "
+                  f"span={bl_span}px ({bl_span/nh_w*100:.0f}%)")
+        c_h, c_v = classify_lines_courtside(c_raw, baseline_angle=c_bl_angle)
+        c_h = filter_short_merged(merge_collinear_segments(c_h))
+        c_v = filter_short_merged(merge_collinear_segments(c_v))
         c_identified = identify_near_half_lines(c_h, c_v, nh_h, nh_w)
         c_near_kps = compute_near_half_keypoints(c_identified, y_offset, c_v, nh_h)
         c_near_kps = validate_near_half_keypoints(c_near_kps)
-        c_H = compute_near_half_homography(c_near_kps)
-        c_score = score_court_detection(near_half, c_H, y_offset) if c_H is not None else 0
+        c_H, c_near_kps = compute_near_half_homography(c_near_kps)
+        c_score = score_court_detection(near_half, c_H, y_offset, cand_line_mask) if c_H is not None else 0
+        c_err = reprojection_error(c_near_kps, c_H) if c_H is not None else float('inf')
         n = 0 if c_raw is None else len(c_raw)
         print(f"  [Stage 4b] {cand_label}: {len(c_h)}H+{len(c_v)}V, "
-              f"{len(c_near_kps)} kps, score={c_score}")
-        return c_H, c_near_kps, c_identified, c_h, c_v, c_raw, cand_line_mask, c_score
+              f"{len(c_near_kps)} kps, score={c_score}, reproj={c_err:.1f}px")
+        return c_H, c_near_kps, c_identified, c_h, c_v, c_raw, cand_line_mask, c_score, c_err
 
     candidates = []
 
-    # Candidate 1: Local-contrast filter (primary — no global color thresholds)
+    # Candidate 1: Local-contrast AND filter (primary)
     lc_line_mask, lc_court_mask, _, lc_thresh_v, lc_thresh_s = agrawal_local_contrast_line_filter(near_half)
     lc_line_px = np.count_nonzero(lc_line_mask)
     print(f"  [Stage 2+3] LocalContrast: {lc_line_px} line pixels, "
@@ -2227,17 +2388,26 @@ def run_agrawal_pipeline(
     c1 = _run_candidate(lc_line_mask, "LocalContrast")
     candidates.append(("local_contrast", c1, lc_court_mask, court_color, "local_contrast"))
 
-    # Candidate 2: Saturation-based filter (fallback — disabled for local-contrast-only evaluation)
-    # c2 = _run_candidate(line_mask.copy(), "Saturation")
-    # candidates.append(("saturation", c2, court_color_mask, court_color, "single"))
+    # Candidate 2: CLAHE-enhanced filter (night / low-contrast scenes)
+    cl_line_mask, cl_court_mask, _, cl_thresh_v = agrawal_clahe_line_filter(near_half)
+    cl_line_px = np.count_nonzero(cl_line_mask)
+    print(f"  [Stage 2+3] CLAHE: {cl_line_px} line pixels, "
+          f"thresh_v={cl_thresh_v}")
+    c2 = _run_candidate(cl_line_mask, "CLAHE")
+    candidates.append(("clahe", c2, cl_court_mask, court_color, "clahe"))
 
-    # Pick candidate with highest score
-    best_name, best_cand, best_court_mask, best_court_color, best_court_mode = max(
-        candidates, key=lambda x: x[1][7])  # index 7 = score
-    best_H, best_near_kps, best_identified, best_h, best_v, best_raw, best_lm, best_score = best_cand
+    # Pick best candidate: among those with score > 0, choose lowest reproj error
+    valid_candidates = [(name, cand, cm, cc, mode) for name, cand, cm, cc, mode in candidates
+                        if cand[7] > 0]  # index 7 = score
+    if valid_candidates:
+        # Best = highest score (template-line overlap, index 7).
+        # Reproj error is degenerate (fewer KPs → lower error), so use score.
+        best_name, best_cand, best_court_mask, best_court_color, best_court_mode = max(
+            valid_candidates, key=lambda x: x[1][7])  # index 7 = score
+        best_H, best_near_kps, best_identified, best_h, best_v, best_raw, best_lm, best_score, best_err = best_cand
 
-    if best_score > 0:
-        print(f"  [Stage 4b] Winner: {best_name} (score={best_score}, mode={best_court_mode}) ({time.time()-t4b:.3f}s)")
+        print(f"  [Stage 4b] Winner: {best_name} (score={best_score}, reproj={best_err:.1f}px, "
+              f"mode={best_court_mode}) ({time.time()-t4b:.3f}s)")
         horizontal, vertical = best_h, best_v
         raw_lines = best_raw
         n_raw = 0 if raw_lines is None else len(raw_lines)
@@ -2247,12 +2417,13 @@ def run_agrawal_pipeline(
         winning_court_mode = best_court_mode
         identified = best_identified
     else:
-        # No candidate produced a valid homography — fall through with
-        # the saturation result from Stage 4 (already in horizontal/vertical)
-        print(f"  [Stage 4b] No candidate scored > 0, using saturation fallback "
-              f"({time.time()-t4b:.3f}s)")
-        identified = identify_near_half_lines(horizontal, vertical, nh_h, nh_w)
-        winning_court_mode = "single"
+        # No candidate scored > 0 — use best LC candidate for display
+        best_lc = max(candidates, key=lambda x: len(x[1][1]))  # index 1 = near_kps
+        lc_cand = best_lc[1]
+        horizontal, vertical = lc_cand[3], lc_cand[4]
+        line_mask = lc_cand[6]
+        identified = lc_cand[2]
+        winning_court_mode = "local_contrast"
 
     # --- Stage 5: Identify near-half lines (already computed in 4b) ---
     t5 = time.time()
@@ -2261,6 +2432,19 @@ def run_agrawal_pipeline(
     for name, seg in identified.items():
         if seg is not None:
             print(f"    {name}: ({seg[0]},{seg[1]})->({seg[2]},{seg[3]})")
+
+    # --- Stage 5b: Fallback service line detection ---
+    used_sv_fallback = False
+    if identified.get("near_service") is None and identified.get("near_baseline") is not None:
+        fb_service = fallback_service_line_detection(line_mask, identified, nh_h, nh_w)
+        if fb_service is not None:
+            identified["near_service"] = fb_service
+            used_sv_fallback = True
+            print(f"  [Stage 5b] Fallback service line: "
+                  f"({fb_service[0]:.0f},{fb_service[1]:.0f})->"
+                  f"({fb_service[2]:.0f},{fb_service[3]:.0f})")
+        else:
+            print(f"  [Stage 5b] Fallback service line: not found")
 
     # --- Stage 6: Compute near-half keypoints ---
     t6 = time.time()
@@ -2273,15 +2457,35 @@ def run_agrawal_pipeline(
 
     # --- Stage 7: Homography + PnL refinement + extend ---
     t7 = time.time()
-    H_near = compute_near_half_homography(near_kps)
+    H_near, near_kps = compute_near_half_homography(near_kps)
     H_full = None
     H_full_raw = None
     all_kps = list(near_kps)
 
     if H_near is not None:
-        # PnL refinement: refine H_near using detected line correspondences
-        H_near = refine_homography_with_lines(
-            H_near, near_kps, identified, y_offset)
+        print(f"  [Stage 7] --- Initial H (from keypoints only) ---")
+        debug_per_line_chamfer(H_near, line_mask, y_offset, label="InitH")
+
+        # Edge-align with keypoint regularization (RANSAC-cleaned KPs are trustworthy)
+        H_near = refine_homography_edge_align(
+            H_near, line_mask, near_kps, y_offset,
+            lambda_reg=0.3, max_iter=150)
+
+        # Debug: per-line chamfer AFTER edge-align
+        print(f"  [Stage 7] --- After edge-align (lambda_reg=0.3) ---")
+        debug_per_line_chamfer(H_near, line_mask, y_offset, label="PostEdge")
+
+        # Update keypoints from edge-aligned H so PnL uses corrected positions
+        try:
+            H_inv = np.linalg.inv(H_near)
+            meter_pts = np.array([REFERENCE_KPS_METERS[idx] for idx, _ in near_kps],
+                                 dtype=np.float64).reshape(-1, 1, 2)
+            updated_px = cv2.perspectiveTransform(meter_pts, H_inv).reshape(-1, 2)
+            near_kps = [(idx, (float(updated_px[i, 0]), float(updated_px[i, 1])))
+                        for i, (idx, _) in enumerate(near_kps)]
+            print(f"  [Stage 7] Updated {len(near_kps)} KPs from edge-aligned H")
+        except (np.linalg.LinAlgError, cv2.error):
+            print(f"  [Stage 7] Could not update KPs (singular H), keeping originals")
 
         H_full, all_kps = extend_to_full_court(H_near, near_kps)
         H_full_raw = H_full  # keep raw for comparison
@@ -2290,6 +2494,35 @@ def run_agrawal_pipeline(
         print(f"  [Stage 7] Homography computed: near_err={near_err:.1f}px, "
               f"full_err={full_err:.1f}px ({time.time()-t7:.2f}s)")
         print(f"    Total keypoints (near+far): {len(all_kps)}")
+
+        # --- Stage 7 safety: revert fallback if it broke the homography ---
+        if H_full is None and used_sv_fallback:
+            print(f"  [Stage 7] Fallback service line broke homography — reverting")
+            identified["near_service"] = None
+            used_sv_fallback = False
+            # Re-run Stage 6+7 without the fallback service line
+            near_kps = compute_near_half_keypoints(identified, y_offset, vertical, nh_h)
+            near_kps = validate_near_half_keypoints(near_kps)
+            H_near, near_kps = compute_near_half_homography(near_kps)
+            if H_near is not None:
+                H_near = refine_homography_edge_align(
+                    H_near, line_mask, near_kps, y_offset,
+                    lambda_reg=0.3, max_iter=150)
+                try:
+                    H_inv = np.linalg.inv(H_near)
+                    meter_pts = np.array([REFERENCE_KPS_METERS[idx] for idx, _ in near_kps],
+                                         dtype=np.float64).reshape(-1, 1, 2)
+                    updated_px = cv2.perspectiveTransform(meter_pts, H_inv).reshape(-1, 2)
+                    near_kps = [(idx, (float(updated_px[i, 0]), float(updated_px[i, 1])))
+                                for i, (idx, _) in enumerate(near_kps)]
+                except (np.linalg.LinAlgError, cv2.error):
+                    pass
+                H_full, all_kps = extend_to_full_court(H_near, near_kps)
+                H_full_raw = H_full
+                near_err = reprojection_error(near_kps, H_full) if H_full is not None else float("inf")
+                full_err = reprojection_error(all_kps, H_full) if H_full is not None else float("inf")
+                print(f"  [Stage 7] Reverted: near_err={near_err:.1f}px, "
+                      f"full_err={full_err:.1f}px")
 
         # Kalman smoothing
         if kalman is not None and H_full is not None:
@@ -2301,27 +2534,7 @@ def run_agrawal_pipeline(
         print(f"  [Stage 7] Homography FAILED — only {len(near_kps)} keypoints "
               f"(need ≥4)")
 
-        # Fallback: supplement with CNN keypoints
-        if cnn_detected >= 4:
-            print(f"  [Fallback] Using CNN keypoints to supplement")
-            assigned = {k for k, _ in near_kps}
-            for i, (cx, cy) in enumerate(cnn_kps):
-                if cx is not None and cy is not None and i not in assigned:
-                    near_kps.append((i, (cx, cy)))
-                    assigned.add(i)
-            H_near = compute_near_half_homography(near_kps)
-            if H_near is not None:
-                H_full, all_kps = extend_to_full_court(H_near, near_kps)
-                H_full_raw = H_full
-                if H_full is not None:
-                    print(f"  [Fallback] Homography recovered with {len(all_kps)} keypoints")
-                    if kalman is not None:
-                        near_err = reprojection_error(near_kps, H_full)
-                        H_full = kalman.update(H_full, near_err,
-                                               n_kps=len(near_kps),
-                                               frame_idx=frame_idx)
-
-        # If still no homography, try Kalman prediction
+        # If no homography, try Kalman prediction
         if H_full is None and kalman is not None:
             H_pred = kalman.predict()
             if H_pred is not None:
@@ -2333,7 +2546,7 @@ def run_agrawal_pipeline(
     smoothed_near_err = reprojection_error(near_kps, H_full) if H_full is not None else float("inf")
 
     # --- Stage 8: Metrics ---
-    metrics = compute_metrics(near_kps, all_kps, H_full, cnn_kps)
+    metrics = compute_metrics(near_kps, all_kps, H_full)
     print(f"  [Stage 8] Metrics:")
     for k, v in metrics.items():
         if isinstance(v, float):
@@ -2359,7 +2572,6 @@ def run_agrawal_pipeline(
         all_kps=all_kps,
         H_full=H_full,
         y_offset=y_offset,
-        cnn_kps=cnn_kps,
         court_mode=winning_court_mode,
     )
 
@@ -2376,7 +2588,6 @@ def run_agrawal_pipeline(
         "all_kps": [(k, list(p)) for k, p in all_kps],
         "metrics": metrics,
         "composite": composite,
-        "cnn_detected": cnn_detected,
         "total_time": total_time,
         "raw_near_err": raw_near_err,
         "smoothed_near_err": smoothed_near_err,
@@ -2389,37 +2600,49 @@ def main():
     """Entry point: process frames and generate report."""
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    # Open video
-    print(f"Opening video: {VIDEO_PATH}")
-    cap = cv2.VideoCapture(str(VIDEO_PATH))
-    if not cap.isOpened():
-        print(f"ERROR: Cannot open video {VIDEO_PATH}")
-        sys.exit(1)
+    frames: dict[int | str, np.ndarray] = {}
 
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    print(f"Video: {total_frames} frames, {fps:.1f} fps")
+    if IMAGE_DIR is not None and IMAGE_DIR.is_dir():
+        # Load from image directory
+        print(f"Loading images from: {IMAGE_DIR}")
+        image_files = sorted(
+            p for p in IMAGE_DIR.iterdir()
+            if p.suffix.lower() in (".jpg", ".jpeg", ".png", ".bmp")
+        )
+        for img_path in image_files:
+            img = cv2.imread(str(img_path))
+            if img is not None:
+                frames[img_path.stem] = img
+                print(f"  Loaded {img_path.name}: {img.shape[1]}×{img.shape[0]}")
+            else:
+                print(f"  WARNING: Could not read {img_path.name}")
+        video_stem = IMAGE_DIR.name
+    else:
+        # Load from video
+        print(f"Opening video: {VIDEO_PATH}")
+        cap = cv2.VideoCapture(str(VIDEO_PATH))
+        if not cap.isOpened():
+            print(f"ERROR: Cannot open video {VIDEO_PATH}")
+            sys.exit(1)
 
-    # Extract target frames
-    frames: dict[int, np.ndarray] = {}
-    for idx in FRAME_INDICES:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-        ret, frame = cap.read()
-        if ret:
-            frames[idx] = frame
-            print(f"  Extracted frame {idx}: {frame.shape[1]}×{frame.shape[0]}")
-        else:
-            print(f"  WARNING: Could not read frame {idx}")
-    cap.release()
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        print(f"Video: {total_frames} frames, {fps:.1f} fps")
+
+        for idx in FRAME_INDICES:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            ret, frame = cap.read()
+            if ret:
+                frames[idx] = frame
+                print(f"  Extracted frame {idx}: {frame.shape[1]}×{frame.shape[0]}")
+            else:
+                print(f"  WARNING: Could not read frame {idx}")
+        cap.release()
+        video_stem = VIDEO_PATH.stem
 
     if not frames:
         print("ERROR: No frames extracted")
         sys.exit(1)
-
-    # Initialize CNN detector
-    print("\nInitializing CNN court detector...")
-    config = get_config()
-    court_detector = CourtDetector(config, use_refine_kps=True, use_homography=True)
 
     # Initialize YOLO net detector
     net_detector = None
@@ -2429,32 +2652,33 @@ def main():
         net_detector = YOLO(str(net_weights))
         print(f"  YOLO net detector loaded: {net_weights}")
     else:
-        print(f"  YOLO net detector not found at {net_weights}, using CNN fallback")
+        print(f"  YOLO net detector not found at {net_weights}, using heuristic fallback")
 
     # Initialize Kalman smoother for temporal consistency
-    kalman = HomographyKalmanFilter()
+    # Disabled for IMAGE_DIR mode (independent frames from different videos)
+    kalman = None if IMAGE_DIR is not None else HomographyKalmanFilter()
 
     # Initialize shadow remover (optional)
     shadow_remover = ShadowRemover() if ENABLE_SHADOW_REMOVAL else None
 
     # Derive video stem for unique output filenames
-    video_stem = VIDEO_PATH.stem
+    # (video_stem already set above)
 
     # Process each frame
     all_results = []
-    for idx in FRAME_INDICES:
-        if idx not in frames:
-            continue
+    for frame_key in frames:
         print(f"\n{'='*70}")
-        print(f"Processing frame {idx}")
+        print(f"Processing frame {frame_key}")
         print(f"{'='*70}")
 
+        frame_idx = frame_key if isinstance(frame_key, int) else 0
+
         result = run_agrawal_pipeline(
-            frames[idx], idx, court_detector, kalman, shadow_remover,
+            frames[frame_key], frame_idx, kalman, shadow_remover,
             net_detector=net_detector)
 
         # Save diagnostic composite
-        out_path = OUTPUT_DIR / f"agrawal_{video_stem}_frame_{idx}.jpg"
+        out_path = OUTPUT_DIR / f"agrawal_{video_stem}_{frame_key}.jpg"
         cv2.imwrite(str(out_path), result["composite"])
         print(f"  Saved: {out_path}")
 
@@ -2464,21 +2688,19 @@ def main():
     print(f"\n{'='*70}")
     print("SUMMARY")
     print(f"{'='*70}")
-    print(f"{'Frame':>8} {'CNN KPs':>8} {'Near KPs':>9} {'Total KPs':>10} "
+    print(f"{'Frame':>8} {'Near KPs':>9} {'Total KPs':>10} "
           f"{'H valid':>8} {'Raw err':>9} {'Smth err':>9} {'Far err*':>9} "
-          f"{'CNN agr':>8} {'Spread':>10} {'Time':>6}")
-    print("-" * 115)
+          f"{'Spread':>10} {'Time':>6}")
+    print("-" * 95)
     for r in all_results:
         m = r["metrics"]
         print(f"{r['frame_idx']:>8} "
-              f"{r['cnn_detected']:>8} "
               f"{m['n_near_kps']:>9} "
               f"{m['n_total_kps']:>10} "
               f"{'YES' if m['homography_valid'] else 'NO':>8} "
               f"{r['raw_near_err']:>9.1f} "
               f"{r['smoothed_near_err']:>9.1f} "
               f"{m['far_reprojection_error_px']:>9.1f} "
-              f"{m['cnn_agreement_px']:>8.1f} "
               f"{m['keypoint_spread']:>10.0f} "
               f"{r['total_time']:>6.2f}")
     print("  * Far err is self-referential (projected from near-half H)")
