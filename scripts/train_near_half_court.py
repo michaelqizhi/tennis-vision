@@ -12,7 +12,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
-from torch.optim import AdamW
+from torch.optim import Adam
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -73,19 +73,13 @@ def parse_args() -> argparse.Namespace:
         "--lambda-vis",
         type=float,
         default=0.1,
-        help="Weight for visibility loss"
-    )
-    parser.add_argument(
-        "--invis-weight",
-        type=float,
-        default=0.1,
-        help="Weight for invisible keypoint heatmap pixels"
+        help="Weight for visibility loss (only affects vis_fc due to encoder detach)"
     )
     parser.add_argument(
         "--warmup-steps",
         type=int,
-        default=200,
-        help="Number of linear warmup steps"
+        default=0,
+        help="Number of linear warmup steps (0 = no warmup, matching upstream)"
     )
     parser.add_argument(
         "--patience",
@@ -136,8 +130,10 @@ def get_device(device_arg: Optional[str]) -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def create_optimizer(model: NearHalfCourtNet, backbone_lr: float, vis_lr: float) -> AdamW:
+def create_optimizer(model: NearHalfCourtNet, backbone_lr: float, vis_lr: float) -> Adam:
     """Create optimizer with separate parameter groups for backbone and visibility head.
+    
+    Uses Adam with weight_decay=0 to match upstream training configuration.
     
     Args:
         model: The model to optimize
@@ -145,14 +141,14 @@ def create_optimizer(model: NearHalfCourtNet, backbone_lr: float, vis_lr: float)
         vis_lr: Learning rate for visibility head (randomly initialized, learn fast)
     
     Returns:
-        AdamW optimizer with two parameter groups
+        Adam optimizer with two parameter groups
     """
     # Separate parameters: backbone (all conv layers) vs visibility head
     backbone_params = [p for n, p in model.named_parameters() if not n.startswith("vis_")]
     vis_params = [model.vis_fc.weight, model.vis_fc.bias]
     
-    optimizer = AdamW([
-        {"params": backbone_params, "lr": backbone_lr, "weight_decay": 1e-4},
+    optimizer = Adam([
+        {"params": backbone_params, "lr": backbone_lr, "weight_decay": 0},
         {"params": vis_params, "lr": vis_lr, "weight_decay": 0}
     ])
     
@@ -160,7 +156,7 @@ def create_optimizer(model: NearHalfCourtNet, backbone_lr: float, vis_lr: float)
 
 
 def create_scheduler(
-    optimizer: AdamW,
+    optimizer: Adam,
     warmup_steps: int,
     total_steps: int
 ) -> LambdaLR:
@@ -194,22 +190,19 @@ def create_scheduler(
 def extract_keypoints_from_heatmaps(
     heatmaps: torch.Tensor,
     vis_logits: torch.Tensor,
-    vis_threshold: float = 0.5,
-    stride: int = 8
+    vis_threshold: float = 0.5
 ) -> List[Optional[Tuple[float, float]]]:
     """Extract keypoint coordinates from heatmap predictions.
     
     Args:
-        heatmaps: Predicted heatmap logits (7, H, W) at full resolution
+        heatmaps: Predicted heatmap logits (7, H, W) at full resolution (360, 640)
         vis_logits: Predicted visibility logits (7,)
         vis_threshold: Threshold for visibility prediction
-        stride: Stride used to generate heatmaps (default: 8)
     
     Returns:
         List of 7 keypoints in full image space (640×360), each either (x, y) or None if invisible
     """
-    # Apply sigmoid to get probabilities
-    heatmaps_prob = torch.sigmoid(heatmaps)  # (7, H, W)
+    # Apply sigmoid to visibility for thresholding
     vis_prob = torch.sigmoid(vis_logits)  # (7,)
     
     keypoints = []
@@ -217,8 +210,8 @@ def extract_keypoints_from_heatmaps(
         if vis_prob[i] < vis_threshold:
             keypoints.append(None)
         else:
-            # Find argmax in heatmap space
-            heatmap = heatmaps_prob[i]  # (H, W)
+            # Find argmax directly on logits (argmax is invariant to sigmoid)
+            heatmap = heatmaps[i]  # (H, W)
             flat_idx = heatmap.argmax()
             h, w = heatmap.shape
             y = (flat_idx // w).item()
@@ -279,7 +272,7 @@ def train_epoch(
     model: NearHalfCourtNet,
     dataloader: DataLoader,
     criterion: NearHalfCourtLoss,
-    optimizer: AdamW,
+    optimizer: Adam,
     scheduler: LambdaLR,
     device: torch.device,
     epoch: int
@@ -434,7 +427,7 @@ def validate(
 
 def save_checkpoint(
     model: NearHalfCourtNet,
-    optimizer: AdamW,
+    optimizer: Adam,
     scheduler: LambdaLR,
     epoch: int,
     best_val_error: float,
@@ -463,7 +456,7 @@ def save_checkpoint(
 def load_checkpoint(
     checkpoint_path: str,
     model: NearHalfCourtNet,
-    optimizer: AdamW,
+    optimizer: Adam,
     scheduler: LambdaLR,
     device: torch.device
 ) -> Tuple[int, float]:
@@ -558,8 +551,7 @@ def main():
     scheduler = create_scheduler(optimizer, args.warmup_steps, total_steps)
     
     criterion = NearHalfCourtLoss(
-        lambda_vis=args.lambda_vis,
-        invis_weight=args.invis_weight
+        lambda_vis=args.lambda_vis
     )
     
     # Resume from checkpoint if specified
