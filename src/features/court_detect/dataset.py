@@ -32,9 +32,9 @@ _FLIP_PAIRS: list[tuple[int, int]] = [
     (2, 4),  # KP 10 (SV-BL) ↔ KP 11 (SV-BR) — service line L↔R
 ]
 
-# ImageNet normalization
-IMAGENET_MEAN = [0.485, 0.456, 0.406]
-IMAGENET_STD = [0.229, 0.224, 0.225]
+# Simple /255 normalization to match upstream BGR [0,1] input
+_NORM_MEAN = [0, 0, 0]
+_NORM_STD = [1, 1, 1]
 
 STRIDE = 8
 
@@ -47,7 +47,7 @@ def generate_heatmap(
     kp_y: float,
     width: int,
     height: int,
-    sigma: float = 2.5,
+    sigma: float = 18.5,
     visible: bool = True,
 ) -> np.ndarray:
     """Generate a single Gaussian heatmap centered on (kp_x, kp_y).
@@ -57,7 +57,7 @@ def generate_heatmap(
         kp_y: Keypoint y-coordinate (pixels, at the target resolution).
         width: Heatmap width in pixels.
         height: Heatmap height in pixels.
-        sigma: Gaussian spread in pixels (default 2.5).
+        sigma: Gaussian spread in pixels (default 18.5).
         visible: If False, returns an all-zero heatmap.
 
     Returns:
@@ -121,7 +121,7 @@ class NearHalfCourtDataset(Dataset):
     Loads from a labels JSON file produced by scripts/generate_near_half_labels.py.
 
     Each sample dict contains:
-        - "image": (3, H, W) float32 tensor, normalized with ImageNet mean/std.
+        - "image": (3, H, W) float32 tensor, BGR divided by 255 (range [0,1]).
         - "heatmaps": (7, H, W) float32 tensor with Gaussian peaks.
         - "visibility": (7,) float32 tensor (1.0 = visible, 0.0 = off-screen).
         - "metadata": Dict with image_path, video_stem, frame_idx, etc.
@@ -131,7 +131,7 @@ class NearHalfCourtDataset(Dataset):
         images_dir: Root directory containing crop images.
         input_w: Target image width (default 640).
         input_h: Target image height (default 360).
-        sigma: Gaussian heatmap spread in pixels (default 2.5).
+        sigma: Gaussian heatmap spread in pixels (default 18.5, matches upstream hp_radius=55).
         augment: If True, apply training augmentations.
     """
 
@@ -147,7 +147,7 @@ class NearHalfCourtDataset(Dataset):
         input_w: int = 640,
         input_h: int = 360,
         stride: int = STRIDE,
-        sigma: float = 2.5,
+        sigma: float = 18.5,
         augment: bool = True,
         frames: list[dict[str, Any]] | None = None,
     ) -> None:
@@ -216,7 +216,7 @@ class NearHalfCourtDataset(Dataset):
                     fill=0,
                     p=0.3,
                 ),
-                A.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+                A.Normalize(mean=_NORM_MEAN, std=_NORM_STD, max_pixel_value=255.0),
                 ToTensorV2(),
             ],
             keypoint_params=A.KeypointParams(
@@ -229,7 +229,7 @@ class NearHalfCourtDataset(Dataset):
         """Build validation pipeline (resize + normalize only)."""
         return A.Compose(
             [
-                A.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+                A.Normalize(mean=_NORM_MEAN, std=_NORM_STD, max_pixel_value=255.0),
                 ToTensorV2(),
             ],
             keypoint_params=A.KeypointParams(
@@ -254,9 +254,8 @@ class NearHalfCourtDataset(Dataset):
         if image is None:
             raise FileNotFoundError(f"Could not read image: {img_path}")
 
-        # Resize to model input size
+        # Resize to model input size (keep BGR to match upstream pretrained model)
         image = cv2.resize(image, (self.input_w, self.input_h), interpolation=cv2.INTER_LINEAR)
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
         # --- Load keypoints ---
         kp_dict: dict[str, list[float]] = entry.get("keypoints", {})

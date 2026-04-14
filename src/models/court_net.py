@@ -139,12 +139,11 @@ def load_court_detector(weights_path: str, device: str = "cpu") -> CourtDetector
 
 
 class NearHalfCourtNet(nn.Module):
-    """Near-half court keypoint detector with visibility head.
+    """Near-half court keypoint detector.
 
     Same VGG encoder-decoder backbone as CourtDetectorNet but:
     - 7 output heatmaps (near-half keypoints only)
-    - Visibility head: GAP(encoder) → FC(512→7)
-    - No sigmoid in forward() — use BCEWithLogitsLoss during training,
+    - No sigmoid in forward() — use MSE(sigmoid(pred), target) during training,
       apply sigmoid at inference time.
 
     The 7 keypoints correspond to the near-half court lines visible in
@@ -185,13 +184,9 @@ class NearHalfCourtNet(nn.Module):
         self.conv17 = ConvBlock(in_channels=64, out_channels=64)
         self.conv18 = ConvBlock(in_channels=64, out_channels=self.NUM_KEYPOINTS)
 
-        # Visibility head (branches off encoder bottleneck after conv10)
-        self.vis_gap = nn.AdaptiveAvgPool2d(1)
-        self.vis_fc = nn.Linear(512, self.NUM_KEYPOINTS)
-
         self._init_weights()
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass.
 
         Args:
@@ -199,7 +194,6 @@ class NearHalfCourtNet(nn.Module):
 
         Returns:
             heatmaps: (B, 7, H, W) — raw logits, apply sigmoid for probabilities.
-            vis_logits: (B, 7) — per-keypoint visibility logits.
         """
         # Encoder
         x = self.conv1(x)
@@ -214,15 +208,10 @@ class NearHalfCourtNet(nn.Module):
         x = self.pool3(x)
         x = self.conv8(x)
         x = self.conv9(x)
-        enc = self.conv10(x)
-
-        # Visibility head (from encoder bottleneck, detached)
-        # Detach so visibility gradients don't flow back through the encoder.
-        # This keeps the encoder optimized purely for heatmap production.
-        vis_logits = self.vis_fc(self.vis_gap(enc.detach()).flatten(1))
+        x = self.conv10(x)
 
         # Decoder
-        x = self.ups1(enc)
+        x = self.ups1(x)
         x = self.conv11(x)
         x = self.conv12(x)
         x = self.conv13(x)
@@ -232,9 +221,9 @@ class NearHalfCourtNet(nn.Module):
         x = self.ups3(x)
         x = self.conv16(x)
         x = self.conv17(x)
-        heatmaps = self.conv18(x)
+        x = self.conv18(x)
 
-        return heatmaps, vis_logits
+        return x
 
     def _init_weights(self) -> None:
         for module in self.modules():
@@ -245,9 +234,6 @@ class NearHalfCourtNet(nn.Module):
             elif isinstance(module, nn.BatchNorm2d):
                 nn.init.constant_(module.weight, 1)
                 nn.init.constant_(module.bias, 0)
-        # Xavier init for visibility FC layer
-        nn.init.xavier_uniform_(self.vis_fc.weight)
-        nn.init.zeros_(self.vis_fc.bias)
 
 
 # Mapping: NearHalfCourtNet output channel → CourtDetectorNet output channel
@@ -266,7 +252,6 @@ def load_near_half_court_detector(
     - Decoder (conv11–conv17): copy all weights directly (identical architecture).
     - conv18 (final layer): slice 7 channels from the pretrained 15-channel output
       using _NEAR_HALF_TO_ORIG index mapping.
-    - vis_gap/vis_fc: Xavier-initialized (not present in pretrained weights).
 
     Args:
         weights_path: Path to the full-court .pt weights file.
@@ -290,7 +275,9 @@ def load_near_half_court_detector(
                 "Run 'python scripts/download_weights.py' first."
             )
 
-        full_state = torch.load(str(weights), map_location=device, weights_only=False)
+        # Always load to CPU for state dict manipulation (avoids CUDA kernel
+        # compatibility issues during fancy indexing on conv18 channel slicing)
+        full_state = torch.load(str(weights), map_location="cpu", weights_only=False)
         new_state = model.state_dict()
 
         for name, param in full_state.items():
@@ -307,10 +294,6 @@ def load_near_half_court_detector(
                 new_state[name] = param
 
         model.load_state_dict(new_state)
-
-        # Re-init visibility head (not in pretrained weights)
-        nn.init.xavier_uniform_(model.vis_fc.weight)
-        nn.init.zeros_(model.vis_fc.bias)
 
     model = model.to(device)
     model.eval()

@@ -1,7 +1,7 @@
 """Training script for near-half court keypoint detector.
 
 Fine-tunes a pretrained full-court detector for the near-half court view with
-7 keypoints and visibility prediction.
+7 keypoints.
 """
 
 import argparse
@@ -64,18 +64,6 @@ def parse_args() -> argparse.Namespace:
         help="Learning rate for backbone (conv layers)"
     )
     parser.add_argument(
-        "--vis-lr",
-        type=float,
-        default=1e-3,
-        help="Learning rate for visibility head"
-    )
-    parser.add_argument(
-        "--lambda-vis",
-        type=float,
-        default=0.1,
-        help="Weight for visibility loss (only affects vis_fc due to encoder detach)"
-    )
-    parser.add_argument(
         "--warmup-steps",
         type=int,
         default=0,
@@ -112,16 +100,8 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Path to checkpoint to resume from"
     )
-    
-    # Diagnostic mode
-    parser.add_argument(
-        "--diagnostic",
-        action="store_true",
-        help="Run 3 epochs and print lambda_vis calibration recommendation"
-    )
-    
-    return parser.parse_args()
 
+    return parser.parse_args()
 
 def get_device(device_arg: Optional[str]) -> torch.device:
     """Get torch device, auto-detecting if not specified."""
@@ -130,28 +110,34 @@ def get_device(device_arg: Optional[str]) -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def create_optimizer(model: NearHalfCourtNet, backbone_lr: float, vis_lr: float) -> Adam:
-    """Create optimizer with separate parameter groups for backbone and visibility head.
-    
+def create_optimizer(model: NearHalfCourtNet, backbone_lr: float) -> Adam:
+    """Create optimizer with separate parameter groups for backbone and decoder/head.
+
     Uses Adam with weight_decay=0 to match upstream training configuration.
-    
+    Backbone (conv1–conv10) uses backbone_lr; decoder/head (conv11–conv18) uses 10x.
+
     Args:
         model: The model to optimize
-        backbone_lr: Learning rate for conv layers (pretrained, adapt gently)
-        vis_lr: Learning rate for visibility head (randomly initialized, learn fast)
-    
+        backbone_lr: Learning rate for backbone conv layers (pretrained, adapt gently)
+
     Returns:
         Adam optimizer with two parameter groups
     """
-    # Separate parameters: backbone (all conv layers) vs visibility head
-    backbone_params = [p for n, p in model.named_parameters() if not n.startswith("vis_")]
-    vis_params = [model.vis_fc.weight, model.vis_fc.bias]
-    
+    backbone_layer_names = {f"conv{i}" for i in range(1, 11)} | {f"pool{i}" for i in range(1, 4)}
+    backbone_params = [
+        p for n, p in model.named_parameters()
+        if n.split(".")[0] in backbone_layer_names
+    ]
+    head_params = [
+        p for n, p in model.named_parameters()
+        if n.split(".")[0] not in backbone_layer_names
+    ]
+
     optimizer = Adam([
         {"params": backbone_params, "lr": backbone_lr, "weight_decay": 0},
-        {"params": vis_params, "lr": vis_lr, "weight_decay": 0}
+        {"params": head_params, "lr": backbone_lr * 10, "weight_decay": 0},
     ])
-    
+
     return optimizer
 
 
@@ -189,36 +175,30 @@ def create_scheduler(
 
 def extract_keypoints_from_heatmaps(
     heatmaps: torch.Tensor,
-    vis_logits: torch.Tensor,
-    vis_threshold: float = 0.5
+    vis_threshold: float = 0.3
 ) -> List[Optional[Tuple[float, float]]]:
     """Extract keypoint coordinates from heatmap predictions.
-    
+
     Args:
         heatmaps: Predicted heatmap logits (7, H, W) at full resolution (360, 640)
-        vis_logits: Predicted visibility logits (7,)
-        vis_threshold: Threshold for visibility prediction
-    
+        vis_threshold: Minimum max sigmoid activation to consider a keypoint detected
+
     Returns:
-        List of 7 keypoints in full image space (640×360), each either (x, y) or None if invisible
+        List of 7 keypoints in full image space (640×360), each either (x, y) or None
     """
-    # Apply sigmoid to visibility for thresholding
-    vis_prob = torch.sigmoid(vis_logits)  # (7,)
-    
     keypoints = []
     for i in range(7):
-        if vis_prob[i] < vis_threshold:
+        heatmap = heatmaps[i]  # (H, W)
+        max_val = torch.sigmoid(heatmap).max()
+        if max_val < vis_threshold:
             keypoints.append(None)
         else:
-            # Find argmax directly on logits (argmax is invariant to sigmoid)
-            heatmap = heatmaps[i]  # (H, W)
             flat_idx = heatmap.argmax()
             h, w = heatmap.shape
             y = (flat_idx // w).item()
             x = (flat_idx % w).item()
-            # Coordinates are already in full image space (H, W) = (360, 640)
             keypoints.append((float(x), float(y)))
-    
+
     return keypoints
 
 
@@ -247,27 +227,6 @@ def compute_reprojection_error(
     return np.mean(errors) if errors else float("inf")
 
 
-def compute_visibility_accuracy(
-    pred_vis_logits: torch.Tensor,
-    target_visibility: torch.Tensor,
-    threshold: float = 0.5
-) -> float:
-    """Compute visibility prediction accuracy.
-    
-    Args:
-        pred_vis_logits: Predicted visibility logits (B, 7)
-        target_visibility: Target visibility flags (B, 7)
-        threshold: Threshold for binary prediction
-    
-    Returns:
-        Accuracy as fraction of correct predictions
-    """
-    pred_vis = (torch.sigmoid(pred_vis_logits) > threshold).float()
-    correct = (pred_vis == target_visibility).float().sum()
-    total = target_visibility.numel()
-    return (correct / total).item()
-
-
 def train_epoch(
     model: NearHalfCourtNet,
     dataloader: DataLoader,
@@ -293,27 +252,19 @@ def train_epoch(
     """
     model.train()
     
-    total_losses = {"heatmap_loss": 0.0, "vis_loss": 0.0, "total_loss": 0.0}
+    total_losses = {"heatmap_loss": 0.0, "total_loss": 0.0}
     num_batches = 0
     
     pbar = tqdm(dataloader, desc=f"Epoch {epoch} [Train]")
     for batch in pbar:
         images = batch["image"].to(device)
         target_heatmaps = batch["heatmaps"].to(device)
-        target_visibility = batch["visibility"].to(device)
         
         # Forward pass
-        pred_heatmaps, pred_vis_logits = model(images)
+        heatmaps = model(images)
         
-        # Heatmaps are already at full resolution — no upsampling needed
-        
-        # Compute loss at full resolution
-        loss, loss_dict = criterion(
-            pred_heatmaps,
-            pred_vis_logits,
-            target_heatmaps,
-            target_visibility
-        )
+        # Compute loss
+        loss, loss_dict = criterion(heatmaps, target_heatmaps)
         
         # Backward pass
         optimizer.zero_grad()
@@ -341,88 +292,61 @@ def validate(
     criterion: NearHalfCourtLoss,
     device: torch.device,
     epoch: int
-) -> Tuple[Dict[str, float], float, float]:
+) -> Tuple[Dict[str, float], float]:
     """Validate the model.
-    
+
     Args:
         model: The model to validate
         dataloader: Validation data loader
         criterion: Loss function
         device: Device to validate on
         epoch: Current epoch number (for progress bar)
-    
+
     Returns:
         avg_losses: Dictionary with average loss components
         avg_reproj_error: Average reprojection error in pixels
-        vis_accuracy: Visibility prediction accuracy
     """
     model.eval()
-    
-    total_losses = {"heatmap_loss": 0.0, "vis_loss": 0.0, "total_loss": 0.0}
+
+    total_losses = {"heatmap_loss": 0.0, "total_loss": 0.0}
     num_batches = 0
-    
+
     all_reproj_errors = []
-    all_vis_logits = []
-    all_vis_targets = []
-    
+
     pbar = tqdm(dataloader, desc=f"Epoch {epoch} [Val]  ")
     for batch in pbar:
         images = batch["image"].to(device)
         target_heatmaps = batch["heatmaps"].to(device)
         target_visibility = batch["visibility"].to(device)
         gt_coords = batch["keypoints_coords"]  # (B, 7, 2) in full image space
-        
+
         # Forward pass
-        pred_heatmaps, pred_vis_logits = model(images)
-        
-        # Heatmaps are already at full resolution — no upsampling needed
-        
-        # Compute loss at full resolution
-        loss, loss_dict = criterion(
-            pred_heatmaps,
-            pred_vis_logits,
-            target_heatmaps,
-            target_visibility
-        )
-        
+        pred_heatmaps = model(images)
+
+        # Compute loss
+        loss, loss_dict = criterion(pred_heatmaps, target_heatmaps)
+
         # Accumulate losses
         for key, value in loss_dict.items():
             total_losses[key] += value
         num_batches += 1
-        
+
         # Compute reprojection errors in full image space (640×360)
         for i in range(len(images)):
-            # Extract keypoints from full-res predictions
-            pred_kps = extract_keypoints_from_heatmaps(
-                pred_heatmaps[i].cpu(),
-                pred_vis_logits[i].cpu()
-            )
-            
-            # Use original label coordinates for GT (no argmax quantization)
+            pred_kps = extract_keypoints_from_heatmaps(pred_heatmaps[i].cpu())
             gt_kps = gt_coords[i].numpy()  # (7, 2) — [x, y] per keypoint
-            
             visibility = target_visibility[i].cpu().numpy()
-            
             reproj_error = compute_reprojection_error(pred_kps, gt_kps, visibility)
             if reproj_error != float("inf"):
                 all_reproj_errors.append(reproj_error)
-        
-        # Collect visibility predictions for accuracy
-        all_vis_logits.append(pred_vis_logits.cpu())
-        all_vis_targets.append(target_visibility.cpu())
-    
+
     # Average losses
     avg_losses = {k: v / num_batches for k, v in total_losses.items()}
-    
+
     # Average reprojection error
     avg_reproj_error = np.mean(all_reproj_errors) if all_reproj_errors else float("inf")
-    
-    # Visibility accuracy
-    all_vis_logits = torch.cat(all_vis_logits, dim=0)
-    all_vis_targets = torch.cat(all_vis_targets, dim=0)
-    vis_accuracy = compute_visibility_accuracy(all_vis_logits, all_vis_targets)
-    
-    return avg_losses, avg_reproj_error, vis_accuracy
+
+    return avg_losses, avg_reproj_error
 
 
 def save_checkpoint(
@@ -545,14 +469,12 @@ def main():
     model = model.to(device)
     
     # Create optimizer, scheduler, criterion
-    optimizer = create_optimizer(model, args.backbone_lr, args.vis_lr)
+    optimizer = create_optimizer(model, args.backbone_lr)
     
     total_steps = len(train_loader) * args.epochs
     scheduler = create_scheduler(optimizer, args.warmup_steps, total_steps)
     
-    criterion = NearHalfCourtLoss(
-        lambda_vis=args.lambda_vis
-    )
+    criterion = NearHalfCourtLoss()
     
     # Resume from checkpoint if specified
     start_epoch = 0
@@ -563,43 +485,28 @@ def main():
             args.resume, model, optimizer, scheduler, device
         )
     
-    # Diagnostic mode: run only 3 epochs
-    num_epochs = 3 if args.diagnostic else args.epochs
-    
     # Training loop
-    print(f"\nStarting training for {num_epochs} epochs...")
+    print(f"\nStarting training for {args.epochs} epochs...")
     epochs_without_improvement = 0
     
-    # For diagnostic mode
-    all_heatmap_losses = []
-    all_vis_losses = []
-    
-    for epoch in range(start_epoch, num_epochs):
+    for epoch in range(start_epoch, args.epochs):
         # Train
         train_losses = train_epoch(
             model, train_loader, criterion, optimizer, scheduler, device, epoch + 1
         )
         
         # Validate
-        val_losses, val_reproj_error, val_vis_accuracy = validate(
+        val_losses, val_reproj_error = validate(
             model, val_loader, criterion, device, epoch + 1
         )
         
         # Print epoch summary
-        print(f"\nEpoch {epoch + 1}/{num_epochs}")
+        print(f"\nEpoch {epoch + 1}/{args.epochs}")
         print(f"  Train - Total: {train_losses['total_loss']:.4f}, "
-              f"Heatmap: {train_losses['heatmap_loss']:.4f}, "
-              f"Vis: {train_losses['vis_loss']:.4f}")
+              f"Heatmap: {train_losses['heatmap_loss']:.4f}")
         print(f"  Val   - Total: {val_losses['total_loss']:.4f}, "
-              f"Heatmap: {val_losses['heatmap_loss']:.4f}, "
-              f"Vis: {val_losses['vis_loss']:.4f}")
-        print(f"  Val   - Reproj Error: {val_reproj_error:.3f} px, "
-              f"Vis Accuracy: {val_vis_accuracy:.3f}")
-        
-        # Collect for diagnostic mode
-        if args.diagnostic:
-            all_heatmap_losses.append(val_losses['heatmap_loss'])
-            all_vis_losses.append(val_losses['vis_loss'])
+              f"Heatmap: {val_losses['heatmap_loss']:.4f}")
+        print(f"  Val   - Reproj Error: {val_reproj_error:.3f} px")
         
         # Save best model
         if val_reproj_error < best_val_error:
@@ -622,39 +529,20 @@ def main():
         )
         
         # Early stopping
-        if not args.diagnostic and epochs_without_improvement >= args.patience:
+        if epochs_without_improvement >= args.patience:
             print(f"\nEarly stopping after {args.patience} epochs without improvement")
             break
     
-    # Diagnostic mode: print calibration recommendation
-    if args.diagnostic:
-        mean_heatmap = np.mean(all_heatmap_losses)
-        mean_vis = np.mean(all_vis_losses)
-        
-        print("\n" + "=" * 50)
-        print("=== DIAGNOSTIC RESULTS ===")
-        print(f"Mean heatmap_loss: {mean_heatmap:.4f}")
-        print(f"Mean vis_loss: {mean_vis:.4f}")
-        
-        if mean_vis > 0:
-            recommended_lambda = (mean_heatmap / mean_vis) * 0.3
-            print(f"Recommended lambda_vis = (L_heatmap / L_vis) * 0.3 = {recommended_lambda:.4f}")
-        else:
-            print("Cannot compute recommended lambda_vis (vis_loss is zero)")
-        
-        print("=" * 50)
-    
     # Export final model
-    if not args.diagnostic:
-        print("\nExporting final model...")
-        final_path = output_dir / "near_half_court.pt"
-        
-        # Load best checkpoint and export just the model state
-        best_checkpoint = torch.load(output_dir / "near_half_court_best.pt", weights_only=False)
-        torch.save(best_checkpoint["model_state_dict"], final_path)
-        
-        print(f"✓ Final model saved to: {final_path}")
-        print(f"✓ Best validation reproj error: {best_val_error:.3f} px")
+    print("\nExporting final model...")
+    final_path = output_dir / "near_half_court.pt"
+    
+    # Load best checkpoint and export just the model state
+    best_checkpoint = torch.load(output_dir / "near_half_court_best.pt", weights_only=False)
+    torch.save(best_checkpoint["model_state_dict"], final_path)
+    
+    print(f"✓ Final model saved to: {final_path}")
+    print(f"✓ Best validation reproj error: {best_val_error:.3f} px")
 
 
 if __name__ == "__main__":
