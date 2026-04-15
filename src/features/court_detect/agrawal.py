@@ -259,9 +259,35 @@ def agrawal_local_contrast_line_filter(
         dy = int(round(half * np.sin(np.radians(angle))))
         cv2.line(k, (cx - dx, cy - dy), (cx + dx, cy + dy), 1, 1)
         tv = cv2.morphologyEx(V, cv2.MORPH_TOPHAT, k)
-        bs = cv2.morphologyEx(S, cv2.MORPH_BLACKHAT, k)
         tophat_v = np.maximum(tophat_v, tv.astype(np.float32))
-        blackhat_s = np.maximum(blackhat_s, bs.astype(np.float32))
+
+        # Half-kernel blackhat: split SE into two halves, take max response
+        # This allows detection of lines at court/surround boundaries
+        # where only one side has chromatic court surface.
+        k_left = k.copy()
+        k_right = k.copy()
+
+        # Zero out each half (split perpendicular to the line direction).
+        # For a line at angle θ, the perpendicular is θ+90°.
+        perp_dx = int(round(half * np.cos(np.radians(angle + 90))))
+        perp_dy = int(round(half * np.sin(np.radians(angle + 90))))
+
+        for py in range(tophat_ksize):
+            for px in range(tophat_ksize):
+                vx, vy = px - cx, py - cy
+                proj = vx * perp_dx + vy * perp_dy
+                if proj > 0:
+                    k_left[py, px] = 0
+                elif proj < 0:
+                    k_right[py, px] = 0
+
+        if np.count_nonzero(k_left) >= 3 and np.count_nonzero(k_right) >= 3:
+            bs_left = cv2.morphologyEx(S, cv2.MORPH_BLACKHAT, k_left)
+            bs_right = cv2.morphologyEx(S, cv2.MORPH_BLACKHAT, k_right)
+            bs = np.maximum(bs_left.astype(np.float32), bs_right.astype(np.float32))
+        else:
+            bs = cv2.morphologyEx(S, cv2.MORPH_BLACKHAT, k).astype(np.float32)
+        blackhat_s = np.maximum(blackhat_s, bs)
 
     tophat_v = np.clip(tophat_v, 0, 255).astype(np.uint8)
     blackhat_s = np.clip(blackhat_s, 0, 255).astype(np.uint8)
