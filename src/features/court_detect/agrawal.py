@@ -24,6 +24,7 @@ NET_Y_METERS = 0.0
 NEAR_BASELINE_Y = 11.885
 SERVICE_LINE_Y = 6.4
 MIN_BASELINE_FRAC = 0.70  # baseline must span ≥70% of frame width
+MIN_BASELINE_EXTENT_FRAC = 0.65  # reject baseline extents too narrow for useful spatial masks
 CLASSIFY_ANGLE_TOL = 10   # degrees from baseline angle for H/V classification
 
 # Near-half keypoint indices → meter coords
@@ -69,6 +70,8 @@ HOUGH_THRESHOLD = 30
 HOUGH_MIN_LENGTH = 30
 HOUGH_MAX_GAP = 40
 MIN_MERGED_LENGTH = 200
+MERGE_DEBUG = False
+MERGE_DEBUG_X_RANGE = (400.0, 800.0)
 # ===================================================================
 # Stage 1: Net detection / near-half crop
 # ===================================================================
@@ -306,7 +309,7 @@ def agrawal_local_contrast_line_filter(
     if len(blackhat_court) > 100:
         otsu_s, _ = cv2.threshold(blackhat_court, 0, 255,
                                    cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        thresh_s = max(int(otsu_s * 0.7), 5)
+        thresh_s = max(int(otsu_s * 0.85), 15)
     else:
         thresh_s = 15
 
@@ -540,6 +543,13 @@ def merge_collinear_segments(
     if len(segments) <= 1:
         return segments
 
+    def _debug_center(seg: np.ndarray) -> bool:
+        x_mid = (float(seg[0]) + float(seg[2])) / 2.0
+        return MERGE_DEBUG_X_RANGE[0] <= x_mid <= MERGE_DEBUG_X_RANGE[1]
+
+    def _debug_pair(seg_a: np.ndarray, seg_b: np.ndarray) -> bool:
+        return MERGE_DEBUG and _debug_center(seg_a) and _debug_center(seg_b)
+
     merged: list[np.ndarray] = []
     used = [False] * len(segments)
 
@@ -554,7 +564,15 @@ def merge_collinear_segments(
                 continue
             aj = _seg_angle(segments[j])
             adiff = min(abs(ai - aj), 180 - abs(ai - aj))
+            debug_pair = _debug_pair(segments[i], segments[j])
             if adiff > angle_tol:
+                if debug_pair:
+                    print(
+                        f"    [MergeDebug] pair i={i} j={j} "
+                        f"seg_i={tuple(int(v) for v in segments[i])} "
+                        f"seg_j={tuple(int(v) for v in segments[j])} "
+                        f"angle_diff={adiff:.2f} > angle_tol={angle_tol:.2f} -> NO (angle)"
+                    )
                 continue
 
             # Use the longer segment as the reference line (more stable)
@@ -581,8 +599,24 @@ def merge_collinear_segments(
             effective_tol = dist_tol * (1.0 - 0.7 * adiff / angle_tol)
 
             if max_dist < effective_tol:
+                if debug_pair:
+                    print(
+                        f"    [MergeDebug] pair i={i} j={j} "
+                        f"seg_i={tuple(int(v) for v in segments[i])} "
+                        f"seg_j={tuple(int(v) for v in segments[j])} "
+                        f"angle_diff={adiff:.2f} d1={d1:.2f} d2={d2:.2f} "
+                        f"max_dist={max_dist:.2f} effective_tol={effective_tol:.2f} -> YES"
+                    )
                 group.append(segments[j])
                 used[j] = True
+            elif debug_pair:
+                print(
+                    f"    [MergeDebug] pair i={i} j={j} "
+                    f"seg_i={tuple(int(v) for v in segments[i])} "
+                    f"seg_j={tuple(int(v) for v in segments[j])} "
+                    f"angle_diff={adiff:.2f} d1={d1:.2f} d2={d2:.2f} "
+                    f"max_dist={max_dist:.2f} effective_tol={effective_tol:.2f} -> NO (distance)"
+                )
 
         # Get line direction from the longest segment in the group
         best = max(group, key=lambda s: np.hypot(s[2] - s[0], s[3] - s[1]))
@@ -602,11 +636,31 @@ def merge_collinear_segments(
 
         # Sort by start projection
         intervals.sort(key=lambda x: x[0])
+        debug_group = MERGE_DEBUG and any(_debug_center(s) for s in group)
+        if debug_group:
+            print(
+                f"    [MergeDebug] group seed i={i} size={len(group)} "
+                f"best={tuple(int(v) for v in best)}"
+            )
+            for idx_interval, (lo, hi, pt_lo, pt_hi) in enumerate(intervals):
+                print(
+                    f"    [MergeDebug] interval {idx_interval}: "
+                    f"lo={lo:.2f} hi={hi:.2f} "
+                    f"pt_lo={tuple(int(v) for v in pt_lo)} "
+                    f"pt_hi={tuple(int(v) for v in pt_hi)}"
+                )
 
         # Greedily merge intervals within max_gap
         clusters = [intervals[0]]
         for lo, hi, pt_lo, pt_hi in intervals[1:]:
             prev_lo, prev_hi, prev_pt_lo, prev_pt_hi = clusters[-1]
+            gap = lo - prev_hi
+            if debug_group:
+                print(
+                    f"    [MergeDebug] interval_gap prev_hi={prev_hi:.2f} lo={lo:.2f} "
+                    f"gap={gap:.2f} max_gap={max_gap:.2f} -> "
+                    f"{'MERGE' if gap <= max_gap else 'SPLIT'}"
+                )
             if lo - prev_hi <= max_gap:
                 new_hi = max(prev_hi, hi)
                 new_pt_hi = pt_hi if hi >= prev_hi else prev_pt_hi
@@ -845,6 +899,13 @@ def detect_lines_near_half(
     baseline_extent = (bl_result[0], bl_result[1])
     baseline_angle = bl_result[2]
 
+    # Reject baseline extents too narrow to produce useful spatial masks
+    extent_span = baseline_extent[1] - baseline_extent[0]
+    if extent_span < w * MIN_BASELINE_EXTENT_FRAC:
+        print(f"    [ExtentGuard] Rejected: span={extent_span}px "
+              f"({extent_span/w:.0%} < {MIN_BASELINE_EXTENT_FRAC:.0%})")
+        return pass1_lines, None, None, baseline_angle
+
     # --- Create spatial mask from baseline extent ---
     spatial_mask = create_court_spatial_mask(baseline_extent, h, w)
 
@@ -904,11 +965,116 @@ def _point_to_line_dist(px: float, py: float, seg: np.ndarray) -> float:
     return abs(dy * px - dx * py + x2 * y1 - y2 * x1) / length
 
 
+def find_center_service_line(
+    pre_filter_verticals: list[np.ndarray],
+    identified: dict[str, np.ndarray | None],
+    post_filter_verticals: list[np.ndarray],
+    frame_height: int,
+    frame_width: int,
+) -> np.ndarray | None:
+    """Detect the center service line from merged verticals before length filtering."""
+    baseline = identified.get("near_baseline")
+    if baseline is None or not pre_filter_verticals:
+        return None
+
+    bl_left_x = min(float(baseline[0]), float(baseline[2]))
+    bl_right_x = max(float(baseline[0]), float(baseline[2]))
+    bl_span = bl_right_x - bl_left_x
+    if bl_span < 1:
+        return None
+
+    bl_y = _line_y_at_x(baseline, frame_width / 2.0)
+    if bl_y is None or bl_y <= 0:
+        return None
+
+    expected_y = bl_y * 0.35
+    min_length = bl_y * 0.23
+    sideline_ids = {
+        id(seg)
+        for name in ("left_doubles", "left_singles", "right_singles", "right_doubles")
+        if (seg := identified.get(name)) is not None
+    }
+
+    vp = estimate_vanishing_point(post_filter_verticals)
+    fallback_angle = None
+    if vp is None:
+        left_line = identified.get("left_singles") or identified.get("left_doubles")
+        right_line = identified.get("right_singles") or identified.get("right_doubles")
+        if left_line is not None and right_line is not None:
+            left_rad = np.radians(2.0 * _seg_angle(left_line))
+            right_rad = np.radians(2.0 * _seg_angle(right_line))
+            fallback_angle = (
+                np.degrees(
+                    np.arctan2(
+                        np.sin(left_rad) + np.sin(right_rad),
+                        np.cos(left_rad) + np.cos(right_rad),
+                    )
+                )
+                / 2.0
+            ) % 180.0
+        elif left_line is not None:
+            fallback_angle = _seg_angle(left_line)
+        elif right_line is not None:
+            fallback_angle = _seg_angle(right_line)
+
+    candidates = []
+    for seg in pre_filter_verticals:
+        pt = line_intersection(baseline, seg, w=frame_width * 2, h=frame_height * 2)
+        if pt is None:
+            continue
+
+        t = (pt[0] - bl_left_x) / bl_span
+        if t < 0.42 or t > 0.58:
+            continue
+
+        length = np.hypot(seg[2] - seg[0], seg[3] - seg[1])
+        if length < min_length:
+            print(f"    [CenterService] Gate 2 reject: length={length:.0f} < {min_length:.0f}")
+            continue
+
+        if id(seg) in sideline_ids:
+            print(f"    [CenterService] Gate 3 reject: segment already matched as sideline")
+            continue
+
+        if seg[1] >= seg[3]:
+            bottom_x, bottom_y = float(seg[0]), float(seg[1])
+        else:
+            bottom_x, bottom_y = float(seg[2]), float(seg[3])
+
+        target_angle = fallback_angle
+        if vp is not None:
+            target_angle = np.degrees(np.arctan2(float(vp[1]) - bottom_y, float(vp[0]) - bottom_x)) % 180.0
+        if target_angle is None:
+            continue
+
+        seg_angle = _seg_angle(seg)
+        angle_diff = _angle_diff(seg_angle, target_angle)
+        if angle_diff > 8.0:
+            print(f"    [CenterService] Gate 4 reject: angle_diff={angle_diff:.1f}° > 8°")
+            continue
+
+        service_y_ratio = bottom_y / bl_y
+        if service_y_ratio < 0.23 or service_y_ratio > 0.42:
+            print(f"    [CenterService] Gate 5 reject: y_ratio={service_y_ratio:.2f} outside [0.23, 0.42]")
+            continue
+
+        candidates.append((abs(bottom_y - expected_y), bottom_y, t, seg))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda item: item[0])
+    _, bottom_y, t, seg = candidates[0]
+    print(f"    [CenterService] Selected: bottom_y={bottom_y:.0f}, t={t:.3f}")
+    return seg
+
+
 def identify_near_half_lines(
     horizontal: list[np.ndarray],
     vertical: list[np.ndarray],
     frame_height: int,
     frame_width: int,
+    pre_filter_verticals: list[np.ndarray] | None = None,
 ) -> dict[str, np.ndarray | None]:
     """Identify which near-half lines correspond to court features.
 
@@ -922,6 +1088,7 @@ def identify_near_half_lines(
     result: dict[str, np.ndarray | None] = {
         "near_service": None,
         "near_baseline": None,
+        "center_service": None,
         "left_singles": None,
         "right_singles": None,
         "left_doubles": None,
@@ -1093,11 +1260,19 @@ def identify_near_half_lines(
             result["right_singles"] = result["right_doubles"]
             result["right_doubles"] = None
 
+    # --- Center service line detection ---
+    if bl_y is not None and pre_filter_verticals is not None:
+        result["center_service"] = find_center_service_line(
+            pre_filter_verticals, result, vertical, frame_height, frame_width)
+
     # --- Service line (uses baseline + sidelines) ---
     if bl_y is not None and len(scored) >= 2:
         baseline_xspan = abs(baseline_seg[2] - baseline_seg[0])
         bl_angle = _seg_angle(baseline_seg)
         expected_y = bl_y * (1.0 - 0.65)  # perspective-adjusted: ~65% up from baseline
+        if result["center_service"] is not None:
+            center_seg = result["center_service"]
+            expected_y = max(float(center_seg[1]), float(center_seg[3]))
 
         service_candidates = []
         for y_at_cx, length, seg in scored[:-1]:
@@ -1962,6 +2137,7 @@ def draw_pipeline_stages(
     colors = {
         "near_baseline": (0, 255, 0),
         "near_service": (0, 200, 200),
+        "center_service": (0, 128, 255),
         "left_singles": (255, 0, 255),
         "right_singles": (255, 0, 255),
         "left_doubles": (200, 200, 0),
@@ -2375,8 +2551,9 @@ def run_agrawal_pipeline(
                   f"span={bl_span}px ({bl_span/nh_w*100:.0f}%)")
         c_h, c_v = classify_lines_courtside(c_raw, baseline_angle=c_bl_angle)
         c_h = filter_short_merged(merge_collinear_segments(c_h))
-        c_v = filter_short_merged(merge_collinear_segments(c_v))
-        c_identified = identify_near_half_lines(c_h, c_v, nh_h, nh_w)
+        c_v_merged = merge_collinear_segments(c_v)
+        c_v = filter_short_merged(c_v_merged)
+        c_identified = identify_near_half_lines(c_h, c_v, nh_h, nh_w, pre_filter_verticals=c_v_merged)
         c_near_kps = compute_near_half_keypoints(c_identified, y_offset, c_v, nh_h)
         c_near_kps = validate_near_half_keypoints(c_near_kps)
         c_H, c_near_kps = compute_near_half_homography(c_near_kps)
