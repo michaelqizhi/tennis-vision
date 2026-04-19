@@ -550,21 +550,33 @@ def merge_collinear_segments(
     def _debug_pair(seg_a: np.ndarray, seg_b: np.ndarray) -> bool:
         return MERGE_DEBUG and _debug_center(seg_a) and _debug_center(seg_b)
 
-    merged: list[np.ndarray] = []
-    used = [False] * len(segments)
+    n = len(segments)
 
-    for i in range(len(segments)):
-        if used[i]:
-            continue
-        group = [segments[i]]
-        used[i] = True
-        ai = _seg_angle(segments[i])
-        for j in range(i + 1, len(segments)):
-            if used[j]:
-                continue
-            aj = _seg_angle(segments[j])
+    # Precompute angles and lengths
+    angles = [_seg_angle(s) for s in segments]
+    lengths = [float(np.hypot(s[2] - s[0], s[3] - s[1])) for s in segments]
+
+    # --- Union-Find ---
+    parent = list(range(n))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(x: int, y: int) -> None:
+        rx, ry = find(x), find(y)
+        if rx != ry:
+            parent[rx] = ry
+
+    # --- Pairwise compatibility (3 conditions) ---
+    for i in range(n):
+        for j in range(i + 1, n):
+            ai, aj = angles[i], angles[j]
             adiff = min(abs(ai - aj), 180 - abs(ai - aj))
             debug_pair = _debug_pair(segments[i], segments[j])
+
             if adiff > angle_tol:
                 if debug_pair:
                     print(
@@ -575,15 +587,11 @@ def merge_collinear_segments(
                     )
                 continue
 
-            # Use the longer segment as the reference line (more stable)
-            len_i = np.hypot(segments[i][2] - segments[i][0],
-                             segments[i][3] - segments[i][1])
-            len_j = np.hypot(segments[j][2] - segments[j][0],
-                             segments[j][3] - segments[j][1])
-            if len_j > len_i:
-                ref, cand, ref_len = segments[j], segments[i], len_j
+            # Use longer segment as reference
+            if lengths[j] > lengths[i]:
+                ref, cand, ref_len = segments[j], segments[i], lengths[j]
             else:
-                ref, cand, ref_len = segments[i], segments[j], len_i
+                ref, cand, ref_len = segments[i], segments[j], lengths[i]
             ref_len = max(ref_len, 1e-6)
 
             # Perpendicular distance of BOTH candidate endpoints to ref line
@@ -598,51 +606,85 @@ def merge_collinear_segments(
             # Adaptive tolerance: tighter when angle difference is larger
             effective_tol = dist_tol * (1.0 - 0.7 * adiff / angle_tol)
 
-            if max_dist < effective_tol:
+            if max_dist >= effective_tol:
                 if debug_pair:
                     print(
                         f"    [MergeDebug] pair i={i} j={j} "
                         f"seg_i={tuple(int(v) for v in segments[i])} "
                         f"seg_j={tuple(int(v) for v in segments[j])} "
                         f"angle_diff={adiff:.2f} d1={d1:.2f} d2={d2:.2f} "
-                        f"max_dist={max_dist:.2f} effective_tol={effective_tol:.2f} -> YES"
+                        f"max_dist={max_dist:.2f} effective_tol={effective_tol:.2f} -> NO (distance)"
                     )
-                group.append(segments[j])
-                used[j] = True
-            elif debug_pair:
+                continue
+
+            # Endpoint-gap along the reference direction
+            ux = (rx2 - rx1) / ref_len
+            uy = (ry2 - ry1) / ref_len
+            tA1 = float(segments[i][0]) * ux + float(segments[i][1]) * uy
+            tA2 = float(segments[i][2]) * ux + float(segments[i][3]) * uy
+            tB1 = float(segments[j][0]) * ux + float(segments[j][1]) * uy
+            tB2 = float(segments[j][2]) * ux + float(segments[j][3]) * uy
+            minA, maxA = min(tA1, tA2), max(tA1, tA2)
+            minB, maxB = min(tB1, tB2), max(tB1, tB2)
+            ep_gap = max(0.0, max(minA, minB) - min(maxA, maxB))
+
+            if ep_gap > max_gap:
+                if debug_pair:
+                    print(
+                        f"    [MergeDebug] pair i={i} j={j} "
+                        f"seg_i={tuple(int(v) for v in segments[i])} "
+                        f"seg_j={tuple(int(v) for v in segments[j])} "
+                        f"angle_diff={adiff:.2f} max_dist={max_dist:.2f} "
+                        f"ep_gap={ep_gap:.2f} > max_gap={max_gap:.2f} -> NO (gap)"
+                    )
+                continue
+
+            if debug_pair:
                 print(
                     f"    [MergeDebug] pair i={i} j={j} "
                     f"seg_i={tuple(int(v) for v in segments[i])} "
                     f"seg_j={tuple(int(v) for v in segments[j])} "
                     f"angle_diff={adiff:.2f} d1={d1:.2f} d2={d2:.2f} "
-                    f"max_dist={max_dist:.2f} effective_tol={effective_tol:.2f} -> NO (distance)"
+                    f"max_dist={max_dist:.2f} effective_tol={effective_tol:.2f} "
+                    f"ep_gap={ep_gap:.2f} -> YES"
                 )
+            union(i, j)
 
-        # Get line direction from the longest segment in the group
-        best = max(group, key=lambda s: np.hypot(s[2] - s[0], s[3] - s[1]))
+    # --- Group by component root ---
+    components: dict[int, list[int]] = {}
+    for idx in range(n):
+        components.setdefault(find(idx), []).append(idx)
+
+    # Process components in deterministic order (smallest member index first)
+    merged: list[np.ndarray] = []
+    for root in sorted(components.keys(), key=lambda r: min(components[r])):
+        member_indices = components[root]
+        group = [segments[k] for k in member_indices]
+
+        # Direction from longest segment in component
+        best_local = max(range(len(group)), key=lambda k: lengths[member_indices[k]])
+        best = group[best_local]
         dx, dy = best[2] - best[0], best[3] - best[1]
         norm = max(np.hypot(dx, dy), 1e-6)
         ux, uy = dx / norm, dy / norm
 
-        # For each segment, compute (min_proj, max_proj, min_pt, max_pt)
         intervals = []
-        for s in group:
+        for s, orig_idx in zip(group, member_indices):
             p1 = s[0] * ux + s[1] * uy
             p2 = s[2] * ux + s[3] * uy
             if p1 <= p2:
-                intervals.append((p1, p2, (s[0], s[1]), (s[2], s[3])))
+                intervals.append((p1, p2, (s[0], s[1]), (s[2], s[3]), orig_idx))
             else:
-                intervals.append((p2, p1, (s[2], s[3]), (s[0], s[1])))
+                intervals.append((p2, p1, (s[2], s[3]), (s[0], s[1]), orig_idx))
 
-        # Sort by start projection
         intervals.sort(key=lambda x: x[0])
         debug_group = MERGE_DEBUG and any(_debug_center(s) for s in group)
         if debug_group:
             print(
-                f"    [MergeDebug] group seed i={i} size={len(group)} "
-                f"best={tuple(int(v) for v in best)}"
+                f"    [MergeDebug] group root={root} size={len(group)} "
+                f"members={member_indices} best={tuple(int(v) for v in best)}"
             )
-            for idx_interval, (lo, hi, pt_lo, pt_hi) in enumerate(intervals):
+            for idx_interval, (lo, hi, pt_lo, pt_hi, _oi) in enumerate(intervals):
                 print(
                     f"    [MergeDebug] interval {idx_interval}: "
                     f"lo={lo:.2f} hi={hi:.2f} "
@@ -650,10 +692,11 @@ def merge_collinear_segments(
                     f"pt_hi={tuple(int(v) for v in pt_hi)}"
                 )
 
-        # Greedily merge intervals within max_gap
-        clusters = [intervals[0]]
-        for lo, hi, pt_lo, pt_hi in intervals[1:]:
-            prev_lo, prev_hi, prev_pt_lo, prev_pt_hi = clusters[-1]
+        # Gap-split: cluster intervals by max_gap
+        first = intervals[0]
+        clusters = [(first[0], first[1], first[2], first[3], [first[4]])]
+        for lo, hi, pt_lo, pt_hi, oi in intervals[1:]:
+            prev_lo, prev_hi, prev_pt_lo, prev_pt_hi, prev_members = clusters[-1]
             gap = lo - prev_hi
             if debug_group:
                 print(
@@ -661,16 +704,17 @@ def merge_collinear_segments(
                     f"gap={gap:.2f} max_gap={max_gap:.2f} -> "
                     f"{'MERGE' if gap <= max_gap else 'SPLIT'}"
                 )
-            if lo - prev_hi <= max_gap:
+            if gap <= max_gap:
                 new_hi = max(prev_hi, hi)
                 new_pt_hi = pt_hi if hi >= prev_hi else prev_pt_hi
-                clusters[-1] = (prev_lo, new_hi, prev_pt_lo, new_pt_hi)
+                prev_members.append(oi)
+                clusters[-1] = (prev_lo, new_hi, prev_pt_lo, new_pt_hi, prev_members)
             else:
-                clusters.append((lo, hi, pt_lo, pt_hi))
+                clusters.append((lo, hi, pt_lo, pt_hi, [oi]))
 
-        # Each cluster becomes an output segment
-        for _, _, (x1, y1), (x2, y2) in clusters:
-            merged.append(np.array([int(x1), int(y1), int(x2), int(y2)]))
+        for c_lo, c_hi, c_pt_lo, c_pt_hi, _members in clusters:
+            merged.append(np.array([int(c_pt_lo[0]), int(c_pt_lo[1]),
+                                    int(c_pt_hi[0]), int(c_pt_hi[1])]))
 
     return merged
 
@@ -983,6 +1027,25 @@ def find_center_service_line(
     if bl_span < 1:
         return None
 
+    # Use sideline-baseline intersections for court-relative t (not frame-relative).
+    # Only use matched pairs (both singles or both doubles) to avoid asymmetric span.
+    for _sl_left_name, _sl_right_name in (
+        ("left_doubles", "right_doubles"),
+        ("left_singles", "right_singles"),
+    ):
+        _sl_left = identified.get(_sl_left_name)
+        _sl_right = identified.get(_sl_right_name)
+        if _sl_left is not None and _sl_right is not None:
+            _lpt = line_intersection(baseline, _sl_left, w=frame_width * 2, h=frame_height * 2)
+            _rpt = line_intersection(baseline, _sl_right, w=frame_width * 2, h=frame_height * 2)
+            if _lpt is not None and _rpt is not None:
+                court_left_x = min(float(_lpt[0]), float(_rpt[0]))
+                court_right_x = max(float(_lpt[0]), float(_rpt[0]))
+                court_span = court_right_x - court_left_x
+                if court_span > 1:
+                    bl_left_x, bl_right_x, bl_span = court_left_x, court_right_x, court_span
+                    break  # prefer doubles (wider span), fall back to singles
+
     bl_y = _line_y_at_x(baseline, frame_width / 2.0)
     if bl_y is None or bl_y <= 0:
         return None
@@ -1024,7 +1087,7 @@ def find_center_service_line(
             continue
 
         t = (pt[0] - bl_left_x) / bl_span
-        if t < 0.42 or t > 0.58:
+        if t < 0.38 or t > 0.62:
             continue
 
         length = np.hypot(seg[2] - seg[0], seg[3] - seg[1])
