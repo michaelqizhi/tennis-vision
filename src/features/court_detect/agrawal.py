@@ -1061,8 +1061,12 @@ def find_center_service_line(
     vp = estimate_vanishing_point(post_filter_verticals)
     fallback_angle = None
     if vp is None:
-        left_line = identified.get("left_singles") or identified.get("left_doubles")
-        right_line = identified.get("right_singles") or identified.get("right_doubles")
+        left_line = identified.get("left_singles")
+        if left_line is None:
+            left_line = identified.get("left_doubles")
+        right_line = identified.get("right_singles")
+        if right_line is None:
+            right_line = identified.get("right_doubles")
         if left_line is not None and right_line is not None:
             left_rad = np.radians(2.0 * _seg_angle(left_line))
             right_rad = np.radians(2.0 * _seg_angle(right_line))
@@ -2415,56 +2419,30 @@ class HomographyKalmanFilter:
 # Court detection scoring (Agrawal Section 3.4)
 # ===================================================================
 
-def score_court_detection(
-    near_half: np.ndarray,
-    H_near: np.ndarray,
-    y_offset: int = 0,
-    line_mask: np.ndarray | None = None,
-) -> int:
-    """Score a court detection by projecting court template lines and counting
-    overlap with bright pixels in the original image (Agrawal Section 3.4).
+def _project_court_lines(H_near, y_offset, nh_h, nh_w, n_samples=30):
+    """Project court template lines into near-half pixel coords.
 
-    H_near maps image pixels → court meters.  We need the inverse
-    (meters → pixels) to project template lines onto the image.
-
-    Returns score = number of projected court pixels that overlap with
-    bright/white pixels in the original frame.
+    Returns list of (pixel_pts, meter_line) for lines with >=2 in-frame points.
+    pixel_pts is Nx2 array in near-half coords.
     """
-    if H_near is None:
-        return 0
-
-    nh_h, nh_w = near_half.shape[:2]
-
-    # Invert homography: pixel→meter to meter→pixel
     try:
         H_inv = np.linalg.inv(H_near)
     except np.linalg.LinAlgError:
-        return 0
+        return []
 
-    # Near-half court lines in meter coords (from NEAR_HALF_KPS)
     court_lines_m = [
-        # Near baseline: KP2 → KP3
-        ((-5.485, 11.885), (5.485, 11.885)),
-        # Near service line: KP10 → KP11
-        ((-4.115, 6.4), (4.115, 6.4)),
-        # Left doubles sideline: KP2 down toward net
-        ((-5.485, 11.885), (-5.485, 0.0)),
-        # Right doubles sideline: KP3 down toward net
-        ((5.485, 11.885), (5.485, 0.0)),
-        # Left singles sideline: KP5 → KP10
-        ((-4.115, 11.885), (-4.115, 6.4)),
-        # Right singles sideline: KP7 → KP11
-        ((4.115, 11.885), (4.115, 6.4)),
-        # Center service line: KP13 toward net
-        ((0.0, 6.4), (0.0, 0.0)),
+        ((-5.485, 11.885), (5.485, 11.885)),   # Near baseline
+        ((-4.115, 6.4), (4.115, 6.4)),          # Near service line
+        ((-5.485, 11.885), (-5.485, 0.0)),      # Left doubles sideline
+        ((5.485, 11.885), (5.485, 0.0)),        # Right doubles sideline
+        ((-4.115, 11.885), (-4.115, 6.4)),      # Left singles sideline
+        ((4.115, 11.885), (4.115, 6.4)),        # Right singles sideline
+        ((0.0, 6.4), (0.0, 0.0)),               # Center service line
     ]
 
-    # Draw projected court lines onto a blank mask
-    proj_mask = np.zeros((nh_h, nh_w), dtype=np.uint8)
-    n_samples_per_line = 50
-
+    projected = []
     for (mx1, my1), (mx2, my2) in court_lines_m:
-        ts = np.linspace(0.0, 1.0, n_samples_per_line)
+        ts = np.linspace(0.0, 1.0, n_samples)
         meter_pts = np.column_stack([
             mx1 + ts * (mx2 - mx1),
             my1 + ts * (my2 - my1),
@@ -2475,32 +2453,225 @@ def score_court_detection(
         except cv2.error:
             continue
 
-        # Adjust for y_offset: H_near maps full-frame pixels, but near_half
-        # is cropped starting at y_offset
         pixel_pts[:, 1] -= y_offset
 
-        # Draw line segments between consecutive projected points
-        for i in range(len(pixel_pts) - 1):
-            pt1 = (int(round(pixel_pts[i, 0])), int(round(pixel_pts[i, 1])))
-            pt2 = (int(round(pixel_pts[i + 1, 0])), int(round(pixel_pts[i + 1, 1])))
-            cv2.line(proj_mask, pt1, pt2, 255, thickness=3)
+        # Keep only points within or near frame bounds
+        margin = 20
+        in_frame = ((pixel_pts[:, 0] >= -margin) & (pixel_pts[:, 0] < nh_w + margin) &
+                    (pixel_pts[:, 1] >= -margin) & (pixel_pts[:, 1] < nh_h + margin))
+        if in_frame.sum() < 2:
+            continue
+        projected.append(pixel_pts[in_frame])
 
-    # Create target mask for scoring
-    if line_mask is not None:
-        # Use candidate's own line mask
-        target_mask = line_mask
-    else:
-        # Fallback: hardcoded bright-pixel mask for backward compatibility
-        hsv = cv2.cvtColor(near_half, cv2.COLOR_BGR2HSV)
-        target_mask = ((hsv[:, :, 2] > 170) & (hsv[:, :, 1] < 60)).astype(np.uint8) * 255
+    return projected
 
-    # Score = fraction of projected court template covered by target pixels
-    # Normalized to avoid bias toward denser masks
-    overlap = cv2.bitwise_and(proj_mask, target_mask)
-    proj_total = max(np.count_nonzero(proj_mask), 1)
-    score = int(np.count_nonzero(overlap) * 10000 / proj_total)  # scale to integer
 
-    return score
+def _line_profile_score(gray, projected_lines, n_profile_samples=24,
+                        perp_halfwidth=10, expected_line_halfwidth=2,
+                        search_radius=8, offset_sigma=4.0):
+    """Score how well projected lines look like white court lines in raw image.
+
+    For each projected line, samples perpendicular brightness profiles and
+    searches for the brightest peak within ±search_radius of the projected
+    center.  Scores the bright-center/dark-flanks pattern at the found peak,
+    then applies a Gaussian penalty based on how far off it is.
+
+    Returns float in [0, 1].
+    """
+    h, w = gray.shape[:2]
+    all_scores = []
+
+    for pts in projected_lines:
+        if len(pts) < 3:
+            continue
+
+        indices = np.linspace(1, len(pts) - 2, min(n_profile_samples, len(pts) - 2))
+        indices = np.unique(indices.astype(int))
+
+        for idx in indices:
+            p = pts[idx]
+            p_prev = pts[max(0, idx - 1)]
+            p_next = pts[min(len(pts) - 1, idx + 1)]
+            tangent = p_next - p_prev
+            tlen = np.linalg.norm(tangent)
+            if tlen < 1e-6:
+                continue
+            tangent = tangent / tlen
+            perp = np.array([-tangent[1], tangent[0]])
+
+            offsets = np.arange(-perp_halfwidth, perp_halfwidth + 1, dtype=np.float32)
+            xs = p[0] + offsets * perp[0]
+            ys = p[1] + offsets * perp[1]
+
+            if xs.min() < 0 or xs.max() >= w or ys.min() < 0 or ys.max() >= h:
+                continue
+
+            profile = cv2.remap(
+                gray,
+                xs.reshape(1, -1).astype(np.float32),
+                ys.reshape(1, -1).astype(np.float32),
+                cv2.INTER_LINEAR,
+            ).ravel().astype(np.float32)
+
+            lo, hi = profile.min(), profile.max()
+            if hi - lo < 20:
+                all_scores.append(0.0)
+                continue
+
+            # Find brightness peak within search window around projected center
+            center = perp_halfwidth  # index of projected center
+            search_lo = max(expected_line_halfwidth + 1, center - search_radius)
+            search_hi = min(len(profile) - expected_line_halfwidth - 2, center + search_radius)
+            if search_lo > search_hi:
+                all_scores.append(0.0)
+                continue
+
+            search_slice = profile[search_lo:search_hi + 1]
+            peak_in_slice = int(np.argmax(search_slice))
+            peak_idx = search_lo + peak_in_slice
+            offset = abs(peak_idx - center)
+
+            # Score contrast at the found peak position
+            hw = expected_line_halfwidth
+            c_lo = max(0, peak_idx - hw)
+            c_hi = min(len(profile), peak_idx + hw + 1)
+            center_val = profile[c_lo:c_hi].mean()
+
+            # Flanks: pixels outside peak ± (hw+1), excluding the line region
+            flank_left = profile[:max(1, peak_idx - hw)].mean()
+            flank_right_start = peak_idx + hw + 1
+            flank_right = (profile[flank_right_start:].mean()
+                           if flank_right_start < len(profile) else flank_left)
+            flank_avg = 0.5 * (flank_left + flank_right)
+
+            contrast = (center_val - flank_avg) / (hi - lo + 1e-6)
+            contrast = max(0.0, min(1.0, contrast))
+
+            # Gaussian distance penalty: score degrades with offset
+            distance_penalty = np.exp(-(offset ** 2) / (2.0 * offset_sigma ** 2))
+
+            all_scores.append(contrast * distance_penalty)
+
+    if not all_scores:
+        return 0.0
+    return float(np.mean(all_scores))
+
+
+def _color_gate_score(hsv, projected_lines, nh_h, nh_w,
+                      search_radius=6, offset_sigma=4.0):
+    """Score whether the region around projected court lines has court-like
+    color on the flanks (chromatic) and line-like color at center (low-sat, bright).
+
+    Searches perpendicular to the projected line for the lowest-saturation
+    point (the actual white line), then compares its saturation to the flanks.
+    Applies a Gaussian distance penalty for offset from projected center.
+
+    Returns float in [0, 1].
+    """
+    S = hsv[:, :, 1]
+
+    scores = []
+
+    for pts in projected_lines:
+        if len(pts) < 3:
+            continue
+
+        indices = np.linspace(1, len(pts) - 2, min(15, len(pts) - 2))
+        indices = np.unique(indices.astype(int))
+
+        for idx in indices:
+            p = pts[idx]
+            p_prev = pts[max(0, idx - 1)]
+            p_next = pts[min(len(pts) - 1, idx + 1)]
+            tangent = p_next - p_prev
+            tlen = np.linalg.norm(tangent)
+            if tlen < 1e-6:
+                continue
+            perp = np.array([-tangent[1], tangent[0]]) / tlen
+
+            # Search for lowest-saturation point within ±search_radius
+            best_s = 255
+            best_offset = 0
+            best_cx, best_cy = -1, -1
+            for d in range(-search_radius, search_radius + 1):
+                cx = int(round(p[0] + d * perp[0]))
+                cy = int(round(p[1] + d * perp[1]))
+                if 0 <= cx < nh_w and 0 <= cy < nh_h:
+                    sv = S[cy, cx]
+                    if sv < best_s:
+                        best_s = sv
+                        best_offset = abs(d)
+                        best_cx, best_cy = cx, cy
+
+            if best_cx < 0:
+                continue
+
+            # Sample flanks at ±10px from the found line center
+            flank_dist = 10
+            fx1 = int(round(best_cx + flank_dist * perp[0]))
+            fy1 = int(round(best_cy + flank_dist * perp[1]))
+            fx2 = int(round(best_cx - flank_dist * perp[0]))
+            fy2 = int(round(best_cy - flank_dist * perp[1]))
+
+            flank_vals = []
+            if 0 <= fx1 < nh_w and 0 <= fy1 < nh_h:
+                flank_vals.append(float(S[fy1, fx1]))
+            if 0 <= fx2 < nh_w and 0 <= fy2 < nh_h:
+                flank_vals.append(float(S[fy2, fx2]))
+
+            if not flank_vals:
+                continue
+
+            s_diff = np.mean(flank_vals) - float(best_s)
+            raw_score = max(0.0, min(1.0, s_diff / 50.0))
+
+            # Gaussian distance penalty
+            distance_penalty = np.exp(-(best_offset ** 2) / (2.0 * offset_sigma ** 2))
+            scores.append(raw_score * distance_penalty)
+
+    if len(scores) < 5:
+        return 0.0
+    return float(np.median(scores))
+
+
+def score_court_detection(
+    near_half: np.ndarray,
+    H_near: np.ndarray,
+    y_offset: int = 0,
+    line_mask: np.ndarray | None = None,
+) -> int:
+    """Score court detection using raw-image verification (line profile + color gate).
+
+    Projects court template lines via H and checks:
+    1. Line profile (70%): do projected lines show bright-center/dark-flanks
+       pattern in raw grayscale? Independent of the detection pipeline.
+    2. Color gate (30%): do projected lines have low saturation (white) with
+       higher saturation flanks (court color)?
+
+    Returns score in [0, 10000].
+    """
+    if H_near is None:
+        return 0
+
+    nh_h, nh_w = near_half.shape[:2]
+
+    # Project court lines
+    projected = _project_court_lines(H_near, y_offset, nh_h, nh_w)
+    if len(projected) < 3:
+        return 0
+
+    gray = cv2.cvtColor(near_half, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(near_half, cv2.COLOR_BGR2HSV)
+
+    # Line profile score (bright-dark-bright cross-section)
+    profile = _line_profile_score(gray, projected)
+
+    # Color gate (low-sat center, high-sat flanks)
+    color = _color_gate_score(hsv, projected, nh_h, nh_w)
+
+    # Combined score: 70% profile + 30% color
+    combined = 0.70 * profile + 0.30 * color
+    return int(round(combined * 10000))
 
 
 # ===================================================================
@@ -2826,6 +2997,7 @@ def run_agrawal_pipeline(
 
     results.update({
         "net_y": net_y,
+        "y_offset": y_offset,
         "court_color": court_color.tolist(),
         "court_type": court_type,
         "court_mode": winning_court_mode,
@@ -2836,6 +3008,10 @@ def run_agrawal_pipeline(
         "near_kps": [(k, list(p)) for k, p in near_kps],
         "all_kps": [(k, list(p)) for k, p in all_kps],
         "metrics": metrics,
+        "near_half": near_half,
+        "line_mask": line_mask,
+        "H_near": H_near,
+        "H_full": H_full,
         "composite": composite,
         "total_time": total_time,
         "raw_near_err": raw_near_err,
