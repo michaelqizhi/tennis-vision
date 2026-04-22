@@ -2148,17 +2148,26 @@ def draw_pipeline_stages(
 
     # Panel 3: All raw Hough lines on near-half
     p3 = near_half.copy()
-    # Draw pre-filter-only verticals (below MIN_MERGED_LENGTH but used for CSL detection)
-    # in orange/dashed style so they're visible as diagnostic context
-    post_filter_set = set()
-    for seg in vertical:
-        post_filter_set.add((int(seg[0]), int(seg[1]), int(seg[2]), int(seg[3])))
+    # Draw pre-filter-only verticals (below MIN_MERGED_LENGTH but still usable for CSL detection)
+    # underneath the post-filter segments so panel 3 reflects the full candidate set.
+    post_filter_set = {
+        (int(seg[0]), int(seg[1]), int(seg[2]), int(seg[3]))
+        for seg in vertical
+    }
+    sub_threshold_verticals: list[np.ndarray] = []
     if pre_filter_verticals is not None:
         for seg in pre_filter_verticals:
             key = (int(seg[0]), int(seg[1]), int(seg[2]), int(seg[3]))
             if key not in post_filter_set:
-                # Draw as orange thin line to distinguish from post-filter segments
-                cv2.line(p3, (seg[0], seg[1]), (seg[2], seg[3]), (0, 128, 255), 1)
+                sub_threshold_verticals.append(seg)
+        for seg in sub_threshold_verticals:
+            cv2.line(
+                p3,
+                (int(seg[0]), int(seg[1])),
+                (int(seg[2]), int(seg[3])),
+                (180, 0, 180),
+                1,
+            )
     for seg in horizontal:
         cv2.line(p3, (seg[0], seg[1]), (seg[2], seg[3]), (255, 100, 0), 2)
     for seg in vertical:
@@ -2172,9 +2181,7 @@ def draw_pipeline_stages(
         mode_label = "CLAHE"
     else:
         mode_label = "SINGLE"
-    n_sub = 0
-    if pre_filter_verticals is not None:
-        n_sub = len(pre_filter_verticals) - len(vertical)
+    n_sub = len(sub_threshold_verticals)
     label = f"3. Raw Hough [{mode_label}] {len(horizontal)}H+{len(vertical)}V"
     if n_sub > 0:
         label += f"+{n_sub}sub"
