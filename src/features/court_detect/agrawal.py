@@ -2126,6 +2126,7 @@ def draw_pipeline_stages(
     H_full: np.ndarray | None,
     y_offset: int,
     court_mode: str = "single",
+    pre_filter_verticals: list[np.ndarray] | None = None,
 ) -> np.ndarray:
     """Create 2×3 diagnostic composite."""
     cell_w, cell_h = 640, 360
@@ -2147,6 +2148,17 @@ def draw_pipeline_stages(
 
     # Panel 3: All raw Hough lines on near-half
     p3 = near_half.copy()
+    # Draw pre-filter-only verticals (below MIN_MERGED_LENGTH but used for CSL detection)
+    # in orange/dashed style so they're visible as diagnostic context
+    post_filter_set = set()
+    for seg in vertical:
+        post_filter_set.add((int(seg[0]), int(seg[1]), int(seg[2]), int(seg[3])))
+    if pre_filter_verticals is not None:
+        for seg in pre_filter_verticals:
+            key = (int(seg[0]), int(seg[1]), int(seg[2]), int(seg[3]))
+            if key not in post_filter_set:
+                # Draw as orange thin line to distinguish from post-filter segments
+                cv2.line(p3, (seg[0], seg[1]), (seg[2], seg[3]), (0, 128, 255), 1)
     for seg in horizontal:
         cv2.line(p3, (seg[0], seg[1]), (seg[2], seg[3]), (255, 100, 0), 2)
     for seg in vertical:
@@ -2156,9 +2168,17 @@ def draw_pipeline_stages(
         mode_label = "MULTI"
     elif court_mode == "local_contrast":
         mode_label = "LOCAL"
+    elif court_mode == "clahe":
+        mode_label = "CLAHE"
     else:
         mode_label = "SINGLE"
-    cv2.putText(p3, f"3. Raw Hough [{mode_label}] {len(horizontal)}H+{len(vertical)}V", (5, 20),
+    n_sub = 0
+    if pre_filter_verticals is not None:
+        n_sub = len(pre_filter_verticals) - len(vertical)
+    label = f"3. Raw Hough [{mode_label}] {len(horizontal)}H+{len(vertical)}V"
+    if n_sub > 0:
+        label += f"+{n_sub}sub"
+    cv2.putText(p3, label, (5, 20),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1)
 
     # Panel 4: Identified court lines only (no raw segments)
@@ -2735,7 +2755,7 @@ def run_agrawal_pipeline(
     # Each candidate computes its own baseline extent so a weak saturation
     # mask cannot clip a stronger local-contrast candidate.
     def _run_candidate(cand_line_mask, cand_label):
-        """Returns (H_near, near_kps, identified, horizontal, vertical, raw_lines, line_mask, score, reproj_err)."""
+        """Returns (H_near, near_kps, identified, horizontal, vertical, raw_lines, line_mask, score, reproj_err, pre_filter_verticals)."""
         c_raw, c_bl_ext, c_sm, c_bl_angle = detect_lines_near_half(cand_line_mask)
         if c_bl_ext is not None:
             cand_line_mask = cv2.bitwise_and(cand_line_mask, c_sm)
@@ -2758,7 +2778,7 @@ def run_agrawal_pipeline(
         n = 0 if c_raw is None else len(c_raw)
         print(f"  [Stage 4b] {cand_label}: {len(c_h)}H+{len(c_v)}V, "
               f"{len(c_near_kps)} kps, score={c_score}, reproj={c_err:.1f}px")
-        return c_H, c_near_kps, c_identified, c_h, c_v, c_raw, cand_line_mask, c_score, c_err
+        return c_H, c_near_kps, c_identified, c_h, c_v, c_raw, cand_line_mask, c_score, c_err, c_v_merged
 
     candidates = []
 
@@ -2786,11 +2806,12 @@ def run_agrawal_pipeline(
         # Reproj error is degenerate (fewer KPs → lower error), so use score.
         best_name, best_cand, best_court_mask, best_court_color, best_court_mode = max(
             valid_candidates, key=lambda x: x[1][7])  # index 7 = score
-        best_H, best_near_kps, best_identified, best_h, best_v, best_raw, best_lm, best_score, best_err = best_cand
+        best_H, best_near_kps, best_identified, best_h, best_v, best_raw, best_lm, best_score, best_err, best_pre_v = best_cand
 
         print(f"  [Stage 4b] Winner: {best_name} (score={best_score}, reproj={best_err:.1f}px, "
               f"mode={best_court_mode}) ({time.time()-t4b:.3f}s)")
         horizontal, vertical = best_h, best_v
+        pre_filter_verticals = best_pre_v
         raw_lines = best_raw
         n_raw = 0 if raw_lines is None else len(raw_lines)
         line_mask = best_lm
@@ -2803,6 +2824,7 @@ def run_agrawal_pipeline(
         best_lc = max(candidates, key=lambda x: len(x[1][1]))  # index 1 = near_kps
         lc_cand = best_lc[1]
         horizontal, vertical = lc_cand[3], lc_cand[4]
+        pre_filter_verticals = lc_cand[9]
         line_mask = lc_cand[6]
         identified = lc_cand[2]
         winning_court_mode = "local_contrast"
@@ -2955,6 +2977,7 @@ def run_agrawal_pipeline(
         H_full=H_full,
         y_offset=y_offset,
         court_mode=winning_court_mode,
+        pre_filter_verticals=pre_filter_verticals,
     )
 
     results.update({
