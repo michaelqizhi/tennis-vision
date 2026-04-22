@@ -1068,17 +1068,16 @@ def find_center_service_line(
         if right_line is None:
             right_line = identified.get("right_doubles")
         if left_line is not None and right_line is not None:
-            left_rad = np.radians(2.0 * _seg_angle(left_line))
-            right_rad = np.radians(2.0 * _seg_angle(right_line))
-            fallback_angle = (
-                np.degrees(
-                    np.arctan2(
-                        np.sin(left_rad) + np.sin(right_rad),
-                        np.cos(left_rad) + np.cos(right_rad),
-                    )
-                )
-                / 2.0
-            ) % 180.0
+            # Use sideline intersection as a fallback vanishing point.
+            # The old double-angle circular mean picked the wrong arc
+            # when sideline angles straddled the 0/180° boundary.
+            sl_vp = line_intersection(
+                left_line, right_line, w=frame_width * 4, h=frame_height * 4
+            )
+            if sl_vp is not None:
+                vp = np.array(sl_vp)
+            else:
+                fallback_angle = _seg_angle(left_line)
         elif left_line is not None:
             fallback_angle = _seg_angle(left_line)
         elif right_line is not None:
@@ -3001,6 +3000,12 @@ def run_agrawal_pipeline(
         "court_color": court_color.tolist(),
         "court_type": court_type,
         "court_mode": winning_court_mode,
+        "horizontal_segments": [seg.copy() for seg in horizontal],
+        "vertical_segments": [seg.copy() for seg in vertical],
+        "identified_lines": {
+            name: (seg.copy() if isinstance(seg, np.ndarray) else None)
+            for name, seg in identified.items()
+        },
         "n_raw_lines": n_raw,
         "n_horizontal": len(horizontal),
         "n_vertical": len(vertical),
