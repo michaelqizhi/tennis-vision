@@ -1058,31 +1058,6 @@ def find_center_service_line(
         if (seg := identified.get(name)) is not None
     }
 
-    vp = estimate_vanishing_point(post_filter_verticals)
-    fallback_angle = None
-    if vp is None:
-        left_line = identified.get("left_singles")
-        if left_line is None:
-            left_line = identified.get("left_doubles")
-        right_line = identified.get("right_singles")
-        if right_line is None:
-            right_line = identified.get("right_doubles")
-        if left_line is not None and right_line is not None:
-            # Use sideline intersection as a fallback vanishing point.
-            # The old double-angle circular mean picked the wrong arc
-            # when sideline angles straddled the 0/180° boundary.
-            sl_vp = line_intersection(
-                left_line, right_line, w=frame_width * 4, h=frame_height * 4
-            )
-            if sl_vp is not None:
-                vp = np.array(sl_vp)
-            else:
-                fallback_angle = _seg_angle(left_line)
-        elif left_line is not None:
-            fallback_angle = _seg_angle(left_line)
-        elif right_line is not None:
-            fallback_angle = _seg_angle(right_line)
-
     candidates = []
     for seg in pre_filter_verticals:
         pt = line_intersection(baseline, seg, w=frame_width * 2, h=frame_height * 2)
@@ -1107,21 +1082,9 @@ def find_center_service_line(
         else:
             bottom_x, bottom_y = float(seg[2]), float(seg[3])
 
-        target_angle = fallback_angle
-        if vp is not None:
-            target_angle = np.degrees(np.arctan2(float(vp[1]) - bottom_y, float(vp[0]) - bottom_x)) % 180.0
-        if target_angle is None:
-            continue
-
-        seg_angle = _seg_angle(seg)
-        angle_diff = _angle_diff(seg_angle, target_angle)
-        if angle_diff > 8.0:
-            print(f"    [CenterService] Gate 4 reject: angle_diff={angle_diff:.1f}° > 8°")
-            continue
-
         service_y_ratio = bottom_y / bl_y
         if service_y_ratio < 0.23 or service_y_ratio > 0.42:
-            print(f"    [CenterService] Gate 5 reject: y_ratio={service_y_ratio:.2f} outside [0.23, 0.42]")
+            print(f"    [CenterService] Gate 4 reject: y_ratio={service_y_ratio:.2f} outside [0.23, 0.42]")
             continue
 
         candidates.append((abs(bottom_y - expected_y), bottom_y, t, seg))
