@@ -313,7 +313,10 @@ def agrawal_local_contrast_line_filter(
     else:
         thresh_s = 15
 
-    line_candidate = (tophat_v > thresh_v) & (blackhat_s > thresh_s)
+    high_thresh_v = max(thresh_v * 2.0, 50)
+    line_candidate = (tophat_v > high_thresh_v) | (
+        (tophat_v > thresh_v) & (blackhat_s > thresh_s)
+    )
     court_mask = (V > 30).astype(np.uint8) * 255
 
     court_01 = (court_mask > 0).astype(np.float32)
