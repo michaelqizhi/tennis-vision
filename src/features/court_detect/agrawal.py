@@ -839,7 +839,7 @@ def _find_baseline_extent(
         length = np.hypot(x2 - x1, y2 - y1)
 
         is_horizontal = angle < 15 or angle > 165
-        is_bottom = (y_cx is not None and y_cx > frame_height * 0.50)
+        is_bottom = (y_cx is not None and y_cx > frame_height / 3)
         is_long = length > frame_width * 0.10
 
         if is_horizontal and is_bottom and is_long:
