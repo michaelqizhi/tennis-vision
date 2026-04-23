@@ -1019,9 +1019,9 @@ def find_center_service_line(
     frame_height: int,
     frame_width: int,
 ) -> np.ndarray | None:
-    """Detect the center service line from merged verticals before length filtering."""
+    """Detect the center service line with a soft preference for post-filter verticals."""
     baseline = identified.get("near_baseline")
-    if baseline is None or not pre_filter_verticals:
+    if baseline is None or (not pre_filter_verticals and not post_filter_verticals):
         return None
 
     bl_left_x = min(float(baseline[0]), float(baseline[2]))
@@ -1053,7 +1053,6 @@ def find_center_service_line(
     if bl_y is None or bl_y <= 0:
         return None
 
-    expected_y = bl_y * 0.35
     min_length = bl_y * 0.23
     sideline_ids = {
         id(seg)
@@ -1061,43 +1060,73 @@ def find_center_service_line(
         if (seg := identified.get(name)) is not None
     }
 
-    candidates = []
-    for seg in pre_filter_verticals:
-        pt = line_intersection(baseline, seg, w=frame_width * 2, h=frame_height * 2)
-        if pt is None:
-            continue
+    def _seg_key(seg: np.ndarray) -> tuple[int, int, int, int]:
+        x1, y1, x2, y2 = np.asarray(seg).astype(int).tolist()
+        return x1, y1, x2, y2
 
-        t = (pt[0] - bl_left_x) / bl_span
-        if t < 0.38 or t > 0.62:
-            continue
+    def _collect_candidates(
+        segments: list[np.ndarray],
+        skip_keys: set[tuple[int, int, int, int]] | None = None,
+    ) -> tuple[list[tuple[float, float, float, np.ndarray]], set[tuple[int, int, int, int]]]:
+        candidates: list[tuple[float, float, float, np.ndarray]] = []
+        seen_keys: set[tuple[int, int, int, int]] = set()
 
-        length = np.hypot(seg[2] - seg[0], seg[3] - seg[1])
-        if length < min_length:
-            print(f"    [CenterService] Gate 2 reject: length={length:.0f} < {min_length:.0f}")
-            continue
+        for seg in segments:
+            seg_key = _seg_key(seg)
+            seen_keys.add(seg_key)
+            if skip_keys is not None and seg_key in skip_keys:
+                continue
 
-        if id(seg) in sideline_ids:
-            print(f"    [CenterService] Gate 3 reject: segment already matched as sideline")
-            continue
+            pt = line_intersection(baseline, seg, w=frame_width * 2, h=frame_height * 2)
+            if pt is None:
+                continue
 
-        if seg[1] >= seg[3]:
-            bottom_x, bottom_y = float(seg[0]), float(seg[1])
-        else:
-            bottom_x, bottom_y = float(seg[2]), float(seg[3])
+            t = (pt[0] - bl_left_x) / bl_span
+            if t < 0.38 or t > 0.62:
+                continue
 
-        service_y_ratio = bottom_y / bl_y
-        if service_y_ratio < 0.23 or service_y_ratio > 0.42:
-            print(f"    [CenterService] Gate 4 reject: y_ratio={service_y_ratio:.2f} outside [0.23, 0.42]")
-            continue
+            length = np.hypot(seg[2] - seg[0], seg[3] - seg[1])
+            if length < min_length:
+                print(f"    [CenterService] Gate 2 reject: length={length:.0f} < {min_length:.0f}")
+                continue
 
-        candidates.append((abs(bottom_y - expected_y), bottom_y, t, seg))
+            if id(seg) in sideline_ids:
+                print(f"    [CenterService] Gate 3 reject: segment already matched as sideline")
+                continue
 
-    if not candidates:
+            if seg[1] >= seg[3]:
+                bottom_y = float(seg[1])
+            else:
+                bottom_y = float(seg[3])
+
+            service_y_ratio = bottom_y / bl_y
+            if service_y_ratio < 0.23 or service_y_ratio > 0.42:
+                print(f"    [CenterService] Gate 4 reject: y_ratio={service_y_ratio:.2f} outside [0.23, 0.42]")
+                continue
+
+            candidates.append((abs(t - 0.5), bottom_y, t, seg))
+
+        return candidates, seen_keys
+
+    post_candidates, post_keys = _collect_candidates(post_filter_verticals or [])
+    pre_candidates, _ = _collect_candidates(pre_filter_verticals or [], skip_keys=post_keys)
+
+    SOFT_MARGIN = 0.04
+    best_post = min(post_candidates, key=lambda c: c[0], default=None)
+    best_pre = min(pre_candidates, key=lambda c: c[0], default=None)
+
+    if best_post is not None and (best_pre is None or best_post[0] <= best_pre[0] + SOFT_MARGIN):
+        winner = best_post
+        source = "post-filter"
+    else:
+        winner = best_pre
+        source = "pre-filter"
+
+    if winner is None:
         return None
 
-    candidates.sort(key=lambda item: item[0])
-    _, bottom_y, t, seg = candidates[0]
-    print(f"    [CenterService] Selected: bottom_y={bottom_y:.0f}, t={t:.3f}")
+    t_score, bottom_y, t, seg = winner
+    print(f"    [CenterService] Selected ({source}): t_score={t_score:.3f}, bottom_y={bottom_y:.0f}, t={t:.3f}")
     return seg
 
 
