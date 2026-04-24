@@ -12,7 +12,6 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from scipy.optimize import minimize
 
 from src.features.court_detect.court_template import REFERENCE_KPS_METERS
 from src.features.court_detect.shadow_removal import ShadowRemover
@@ -236,6 +235,7 @@ def agrawal_local_contrast_line_filter(
     neighborhood: int = NEIGHBORHOOD_SIZE,
     min_court_neighbors: int = MIN_COURT_NEIGHBORS,
     tophat_ksize: int = TOPHAT_KERNEL_SIZE,
+    hsv: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, int]:
     """Local-contrast Agrawal filter using oriented V top-hat + S black-hat.
 
@@ -246,7 +246,8 @@ def agrawal_local_contrast_line_filter(
 
     Returns (line_mask, court_mask, hsv, thresh_v, thresh_s).
     """
-    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+    if hsv is None:
+        hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
     S = hsv[:, :, 1]
     V = hsv[:, :, 2]
 
@@ -262,7 +263,7 @@ def agrawal_local_contrast_line_filter(
         dy = int(round(half * np.sin(np.radians(angle))))
         cv2.line(k, (cx - dx, cy - dy), (cx + dx, cy + dy), 1, 1)
         tv = cv2.morphologyEx(V, cv2.MORPH_TOPHAT, k)
-        tophat_v = np.maximum(tophat_v, tv.astype(np.float32))
+        np.maximum(tophat_v, tv.astype(np.float32), out=tophat_v)
 
         # Half-kernel blackhat: split SE into two halves, take max response
         # This allows detection of lines at court/surround boundaries
@@ -290,7 +291,7 @@ def agrawal_local_contrast_line_filter(
             bs = np.maximum(bs_left.astype(np.float32), bs_right.astype(np.float32))
         else:
             bs = cv2.morphologyEx(S, cv2.MORPH_BLACKHAT, k).astype(np.float32)
-        blackhat_s = np.maximum(blackhat_s, bs)
+        np.maximum(blackhat_s, bs, out=blackhat_s)
 
     tophat_v = np.clip(tophat_v, 0, 255).astype(np.uint8)
     blackhat_s = np.clip(blackhat_s, 0, 255).astype(np.uint8)
@@ -337,6 +338,7 @@ def agrawal_clahe_line_filter(
     clahe_grid: int = 8,
     court_s_min: int = 40,
     line_s_max: int = SAT_LINE_S_MAX,
+    hsv: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
     """CLAHE-enhanced Agrawal filter for low-contrast / night scenes.
 
@@ -350,7 +352,8 @@ def agrawal_clahe_line_filter(
 
     Returns (line_mask, court_mask, hsv, thresh_v).
     """
-    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+    if hsv is None:
+        hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
     S = hsv[:, :, 1]
     V = hsv[:, :, 2]
 
@@ -370,7 +373,7 @@ def agrawal_clahe_line_filter(
         dy = int(round(half * np.sin(np.radians(angle))))
         cv2.line(k, (cx - dx, cy - dy), (cx + dx, cy + dy), 1, 1)
         tv = cv2.morphologyEx(V_enhanced, cv2.MORPH_TOPHAT, k)
-        tophat_v = np.maximum(tophat_v, tv.astype(np.float32))
+        np.maximum(tophat_v, tv.astype(np.float32), out=tophat_v)
     tophat_v = np.clip(tophat_v, 0, 255).astype(np.uint8)
 
     # Chromatic court mask: colored court surface, excludes dark backgrounds
@@ -1242,6 +1245,26 @@ def identify_near_half_lines(
                 scored_v.append((x_at_ref, length, seg))
         scored_v.sort(key=lambda x: x[0])
 
+        # --- VP consistency filter ---
+        VP_DIST_THRESH = 50  # pixels
+        if len(candidates) >= 3:
+            cand_segs = [seg for _, seg in candidates]
+            vp = estimate_vanishing_point(cand_segs)
+            if vp is not None:
+                vp_filtered = []
+                for t, seg in candidates:
+                    x1, y1, x2, y2 = seg.astype(float)
+                    seg_len = max(np.hypot(x2 - x1, y2 - y1), 1e-6)
+                    dist = abs((y2 - y1) * vp[0] - (x2 - x1) * vp[1]
+                               + x2 * y1 - y2 * x1) / seg_len
+                    if dist < VP_DIST_THRESH:
+                        vp_filtered.append((t, seg))
+                    else:
+                        print(f"    [VP-filter] Rejected t={t:.2f}, VP-dist={dist:.1f}px")
+                if len(vp_filtered) >= 2:
+                    print(f"    [VP-filter] Kept {len(vp_filtered)}/{len(candidates)} candidates")
+                    candidates = vp_filtered
+
         # Expected normalized positions from ITF court proportions
         expected = {
             "left_doubles": 0.0,
@@ -1364,6 +1387,11 @@ def identify_near_half_lines(
             right_sl = result["right_singles"]
             if left_sl is not None or right_sl is not None:
                 tolerance = max(40, baseline_xspan * 0.04)
+                # When CSL provides a strong expected_y, relax tolerance for
+                # candidates near it — handles courts where the service line
+                # extends past the singles sidelines (e.g., pickleball overlays).
+                if result["center_service"] is not None and abs(candidate_y - expected_y) < 20:
+                    tolerance *= 2.0
                 seg_left_x = min(seg[0], seg[2])
                 seg_right_x = max(seg[0], seg[2])
                 # Identify left/right endpoints with their y-values
@@ -1767,272 +1795,6 @@ def compute_near_half_homography(
     return H, inlier_kps
 
 
-EDGE_ALIGN_LINES = {
-    "near_baseline":     ((-5.485, 11.885), (5.485, 11.885)),
-    "left_singles":      ((-4.115, 11.885), (-4.115, 6.4)),
-    "right_singles":     ((4.115, 11.885), (4.115, 6.4)),
-    "left_doubles":      ((-5.485, 11.885), (-5.485, 6.4)),
-    "right_doubles":     ((5.485, 11.885), (5.485, 6.4)),
-    "near_service":      ((-4.115, 6.4), (4.115, 6.4)),
-    "center_service":    ((0.0, 6.4), (0.0, 0.0)),
-    "left_doubles_ext":  ((-5.485, 6.4), (-5.485, 0.0)),
-    "right_doubles_ext": ((5.485, 6.4), (5.485, 0.0)),
-}
-
-
-def compute_distance_transform(line_mask: np.ndarray) -> np.ndarray:
-    """Compute distance transform: dt[y,x] = distance to nearest white pixel."""
-    inverted = 255 - line_mask
-    dt = cv2.distanceTransform(inverted, cv2.DIST_L2, 5)
-    return dt
-
-
-def debug_per_line_chamfer(
-    H: np.ndarray,
-    line_mask: np.ndarray,
-    y_offset: int,
-    n_samples: int = 50,
-    dt_cap: float = 30.0,
-    label: str = "",
-) -> dict[str, float]:
-    """Compute and print per-line chamfer distance for debugging.
-
-    Projects each EDGE_ALIGN_LINES template line through H^-1 into pixel
-    space and measures mean distance to nearest white pixel in line_mask.
-    """
-    dt = compute_distance_transform(line_mask)
-    img_h, img_w = dt.shape
-
-    try:
-        H_inv = np.linalg.inv(H)
-    except np.linalg.LinAlgError:
-        print(f"    [{label}] H is singular, cannot compute per-line chamfer")
-        return {}
-
-    results: dict[str, float] = {}
-    for name, (m1, m2) in EDGE_ALIGN_LINES.items():
-        ts = np.linspace(0.0, 1.0, n_samples)
-        meter_pts = np.column_stack([
-            m1[0] + ts * (m2[0] - m1[0]),
-            m1[1] + ts * (m2[1] - m1[1]),
-        ]).reshape(-1, 1, 2).astype(np.float64)
-
-        try:
-            pixel_pts = cv2.perspectiveTransform(meter_pts, H_inv).reshape(-1, 2)
-        except cv2.error:
-            results[name] = 999.0
-            continue
-
-        pixel_pts[:, 1] -= y_offset
-        distances = []
-        n_oob = 0
-        for px, py in pixel_pts:
-            ix, iy = int(round(px)), int(round(py))
-            if 0 <= ix < img_w and 0 <= iy < img_h:
-                distances.append(min(float(dt[iy, ix]), dt_cap))
-            else:
-                distances.append(dt_cap)
-                n_oob += 1
-        mean_d = float(np.mean(distances))
-        results[name] = mean_d
-
-        # Compute projected pixel endpoints for context
-        p1 = pixel_pts[0]
-        p2 = pixel_pts[-1]
-        oob_str = f", {n_oob}/{n_samples} OOB" if n_oob > 0 else ""
-        print(f"    [{label}] {name:20s}: chamfer={mean_d:5.1f}px  "
-              f"px=({p1[0]:6.1f},{p1[1]:6.1f})->({p2[0]:6.1f},{p2[1]:6.1f})"
-              f"{oob_str}")
-
-    total = float(np.mean(list(results.values()))) if results else 999.0
-    print(f"    [{label}] TOTAL mean chamfer = {total:.2f}px")
-    return results
-
-
-def _edge_align_cost(
-    h8: np.ndarray,
-    dt: np.ndarray,
-    template_lines: list[tuple[tuple[float,float], tuple[float,float]]],
-    y_offset: int,
-    n_samples: int = 50,
-    dt_cap: float = 30.0,
-    penalty: float = 50.0,
-    kp_pixels: np.ndarray | None = None,
-    kp_meters: np.ndarray | None = None,
-    lambda_reg: float = 0.5,
-) -> float:
-    """Compute edge-alignment cost for a candidate homography.
-    
-    Cost = mean truncated chamfer distance of projected template lines
-           to line_mask (via distance transform)
-         + lambda_reg * mean keypoint reprojection error
-    """
-    H = np.zeros((3, 3), dtype=np.float64)
-    H.flat[:8] = h8
-    H[2, 2] = 1.0
-    
-    try:
-        H_inv = np.linalg.inv(H)
-    except np.linalg.LinAlgError:
-        return 1e6
-    
-    if abs(np.linalg.det(H)) < 1e-10:
-        return 1e6
-    
-    img_h, img_w = dt.shape
-    all_distances = []
-    
-    for (mx1, my1), (mx2, my2) in template_lines:
-        ts = np.linspace(0.0, 1.0, n_samples)
-        meter_pts = np.column_stack([
-            mx1 + ts * (mx2 - mx1),
-            my1 + ts * (my2 - my1),
-        ]).reshape(-1, 1, 2).astype(np.float64)
-        
-        try:
-            pixel_pts = cv2.perspectiveTransform(meter_pts, H_inv).reshape(-1, 2)
-        except cv2.error:
-            all_distances.extend([penalty] * n_samples)
-            continue
-        
-        pixel_pts[:, 1] -= y_offset
-
-        # Bilinear interpolation on DT for smooth sub-pixel gradients
-        px_arr = pixel_pts[:, 0]
-        py_arr = pixel_pts[:, 1]
-        in_bounds = ((px_arr >= 0) & (px_arr < img_w - 1) &
-                     (py_arr >= 0) & (py_arr < img_h - 1))
-        for j in range(len(px_arr)):
-            if in_bounds[j]:
-                x, y = float(px_arr[j]), float(py_arr[j])
-                x0, y0 = int(x), int(y)
-                x1, y1 = x0 + 1, y0 + 1
-                fx, fy = x - x0, y - y0
-                d = (dt[y0, x0] * (1 - fx) * (1 - fy) +
-                     dt[y0, x1] * fx * (1 - fy) +
-                     dt[y1, x0] * (1 - fx) * fy +
-                     dt[y1, x1] * fx * fy)
-                all_distances.append(min(float(d), dt_cap))
-            else:
-                all_distances.append(penalty)
-    
-    if not all_distances:
-        return 1e6
-    
-    chamfer_cost = np.mean(all_distances)
-    
-    reg_cost = 0.0
-    if kp_pixels is not None and kp_meters is not None and lambda_reg > 0:
-        meter_pts = kp_meters.reshape(-1, 1, 2).astype(np.float64)
-        try:
-            proj = cv2.perspectiveTransform(meter_pts, H_inv).reshape(-1, 2)
-            diffs = proj - kp_pixels
-            reg_cost = np.mean(np.sqrt(np.sum(diffs**2, axis=1)))
-        except (cv2.error, np.linalg.LinAlgError):
-            reg_cost = 100.0
-    
-    return chamfer_cost + lambda_reg * reg_cost
-
-
-def refine_homography_edge_align(
-    H_init: np.ndarray,
-    line_mask: np.ndarray,
-    near_kps: list[tuple[int, tuple[float, float]]],
-    y_offset: int,
-    lambda_reg: float = 0.5,
-    n_samples: int = 50,
-    dt_cap: float = 30.0,
-    max_iter: int = 100,
-    min_init_quality: float = 25.0,
-) -> np.ndarray:
-    """Refine homography by maximizing alignment with edge/line mask.
-    
-    Uses distance transform of the local-contrast line mask as a smooth
-    cost landscape. Optimizes 8-DOF homography to minimize mean chamfer
-    distance of projected court template lines to mask pixels.
-    """
-    if H_init is None:
-        return H_init
-    
-    dt = compute_distance_transform(line_mask)
-    template_lines = list(EDGE_ALIGN_LINES.values())
-    
-    kp_pixels = np.array([[px, py] for _, (px, py) in near_kps], dtype=np.float64)
-    kp_meters = np.array([REFERENCE_KPS_METERS[idx] for idx, _ in near_kps],
-                         dtype=np.float64)
-    
-    h0 = H_init.flatten()[:8] / H_init[2, 2]
-    
-    init_cost = _edge_align_cost(
-        h0, dt, template_lines, y_offset, n_samples, dt_cap, 50.0,
-        kp_pixels, kp_meters, lambda_reg)
-
-    # Debug: show per-line chamfer and per-KP reprojection BEFORE optimization
-    print(f"    [EdgeAlign] --- BEFORE optimization (total_cost={init_cost:.2f}, "
-          f"lambda_reg={lambda_reg}) ---")
-    debug_per_line_chamfer(H_init, line_mask, y_offset, n_samples, dt_cap,
-                           label="EdgeAlign-BEFORE")
-    # Per-KP reprojection error
-    try:
-        H_inv_init = np.linalg.inv(H_init)
-        m_pts = kp_meters.reshape(-1, 1, 2).astype(np.float64)
-        proj_init = cv2.perspectiveTransform(m_pts, H_inv_init).reshape(-1, 2)
-        for i, (kp_idx, (px, py)) in enumerate(near_kps):
-            name = KP_NAMES[kp_idx] if kp_idx < len(KP_NAMES) else f"KP{kp_idx}"
-            dx = proj_init[i, 0] - px
-            dy = proj_init[i, 1] - py
-            err = np.hypot(dx, dy)
-            print(f"    [EdgeAlign-BEFORE] KP{kp_idx:2d} ({name:6s}): "
-                  f"reproj_err={err:6.1f}px  "
-                  f"(proj=({proj_init[i,0]:.1f},{proj_init[i,1]:.1f}) "
-                  f"vs det=({px:.1f},{py:.1f}))")
-    except np.linalg.LinAlgError:
-        print(f"    [EdgeAlign-BEFORE] Cannot compute KP reproj (singular H)")
-
-    if init_cost > min_init_quality:
-        print(f"    [EdgeAlign] Initial cost too high ({init_cost:.1f} > "
-              f"{min_init_quality}), skipping")
-        return H_init
-    
-    result = minimize(
-        _edge_align_cost,
-        h0,
-        args=(dt, template_lines, y_offset, n_samples, dt_cap, 50.0,
-              kp_pixels, kp_meters, lambda_reg),
-        method='L-BFGS-B',
-        options={'maxiter': max_iter, 'ftol': 1e-6, 'disp': False},
-    )
-    
-    H_refined = np.zeros((3, 3), dtype=np.float64)
-    H_refined.flat[:8] = result.x
-    H_refined[2, 2] = 1.0
-    
-    refined_cost = result.fun
-    
-    err_init = reprojection_error(near_kps, H_init)
-    err_refined = reprojection_error(near_kps, H_refined)
-
-    # Debug: show per-line chamfer AFTER optimization
-    print(f"    [EdgeAlign] --- AFTER optimization (total_cost={refined_cost:.2f}, "
-          f"iterations={result.nit}, converged={result.success}) ---")
-    debug_per_line_chamfer(H_refined, line_mask, y_offset, n_samples, dt_cap,
-                           label="EdgeAlign-AFTER")
-    
-    # When lambda_reg=0, accept purely on chamfer improvement (KPs are untrusted)
-    accept = refined_cost < init_cost
-    if lambda_reg > 0:
-        accept = accept and err_refined < err_init * 1.5
-
-    if accept:
-        print(f"    [EdgeAlign] Refined: chamfer {init_cost:.2f} → {refined_cost:.2f}px, "
-              f"reproj {err_init:.2f} → {err_refined:.2f}px")
-        return H_refined
-    else:
-        print(f"    [EdgeAlign] No improvement (chamfer {init_cost:.2f} → {refined_cost:.2f}, "
-              f"reproj {err_init:.2f} → {err_refined:.2f}), keeping original")
-        return H_init
-
-
 def extend_to_full_court(
     H_near: np.ndarray,
     near_kps: list[tuple[int, tuple[float, float]]],
@@ -2243,29 +2005,21 @@ def draw_pipeline_stages(
     cv2.putText(p4, "4. Court lines", (5, 20),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
 
-    # Panel 5: Edge-alignment overlay (line mask + projected template)
+    # Panel 5: Homography overlay on the near-half line mask
     p5 = resize(line_mask)
     if H_full is not None:
         try:
-            H_inv = np.linalg.inv(H_full)
             mask_h, mask_w = line_mask.shape[:2]
             sx = cell_w / mask_w
             sy = cell_h / mask_h
-            for (m1, m2) in EDGE_ALIGN_LINES.values():
-                ts = np.linspace(0, 1, 50)
-                pts_m = np.column_stack([
-                    m1[0] + ts*(m2[0]-m1[0]),
-                    m1[1] + ts*(m2[1]-m1[1]),
-                ]).reshape(-1,1,2).astype(np.float64)
-                pts_px = cv2.perspectiveTransform(pts_m, H_inv).reshape(-1,2)
-                pts_px[:, 1] -= y_offset
-                for i in range(len(pts_px)-1):
-                    pt1 = (int(pts_px[i,0]*sx), int(pts_px[i,1]*sy))
-                    pt2 = (int(pts_px[i+1,0]*sx), int(pts_px[i+1,1]*sy))
+            for pts_px in _project_court_lines(H_full, y_offset, mask_h, mask_w, n_samples=50):
+                for i in range(len(pts_px) - 1):
+                    pt1 = (int(pts_px[i, 0] * sx), int(pts_px[i, 1] * sy))
+                    pt2 = (int(pts_px[i + 1, 0] * sx), int(pts_px[i + 1, 1] * sy))
                     cv2.line(p5, pt1, pt2, (0, 255, 0), 1)
         except Exception:
             pass
-    cv2.putText(p5, "5. Edge-align overlay", (5, 20),
+    cv2.putText(p5, "5. Homography overlay", (5, 20),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
 
     # Panel 6: Final keypoints on original frame
@@ -2660,6 +2414,8 @@ def score_court_detection(
     H_near: np.ndarray,
     y_offset: int = 0,
     line_mask: np.ndarray | None = None,
+    gray: np.ndarray | None = None,
+    hsv: np.ndarray | None = None,
 ) -> int:
     """Score court detection using raw-image verification (line profile + color gate).
 
@@ -2681,8 +2437,10 @@ def score_court_detection(
     if len(projected) < 3:
         return 0
 
-    gray = cv2.cvtColor(near_half, cv2.COLOR_BGR2GRAY)
-    hsv = cv2.cvtColor(near_half, cv2.COLOR_BGR2HSV)
+    if gray is None:
+        gray = cv2.cvtColor(near_half, cv2.COLOR_BGR2GRAY)
+    if hsv is None:
+        hsv = cv2.cvtColor(near_half, cv2.COLOR_BGR2HSV)
 
     # Line profile score (bright-dark-bright cross-section)
     profile = _line_profile_score(gray, projected)
@@ -2742,53 +2500,11 @@ def run_agrawal_pipeline(
                   f"(discrim={discrim:.3f}, shadow_ratio={shadow_ratio:.2f}, "
                   f"{time.time()-t_sr:.3f}s)")
 
-    # --- Stage 2+3: Saturation-based Agrawal filter (color-agnostic) ---
-    t2 = time.time()
-    line_mask, court_color_mask, hsv_full, eff_tophat = agrawal_saturation_line_filter(near_half)
-    # Derive court_color for logging/visualization (median HSV of chromatic pixels)
-    chromatic_px = hsv_full[court_color_mask > 0]
-    if len(chromatic_px) > 0:
-        court_h = int(np.median(chromatic_px[:, 0]))
-        court_s = int(np.median(chromatic_px[:, 1]))
-        court_v = int(np.median(chromatic_px[:, 2]))
-    else:
-        court_h, court_s, court_v = 0, 0, 0
-    court_color = np.array([court_h, court_s, court_v], dtype=np.uint8)
-    # Classify for logging only
-    if 90 <= court_h <= 125:
-        court_type = "blue"
-    elif 35 <= court_h <= 85:
-        court_type = "green"
-    elif court_h <= 25 or court_h >= 170:
-        court_type = "clay"
-    else:
-        court_type = "unknown"
-    print(f"  [Stage 2+3] Saturation Agrawal: {np.count_nonzero(line_mask)} line pixels, "
-          f"tophat_thresh={eff_tophat}, "
-          f"court={court_type}(H={court_h} S={court_s} V={court_v}) ({time.time()-t2:.3f}s)")
-
-    # --- Stage 4: Two-pass Hough with baseline-anchored spatial masking ---
-    t4 = time.time()
-    raw_lines, baseline_extent, spatial_mask, bl_angle = detect_lines_near_half(line_mask)
-    n_raw = 0 if raw_lines is None else len(raw_lines)
-
-    if baseline_extent is not None:
-        bl_x_left, bl_x_right = baseline_extent
-        masked_px = np.count_nonzero(cv2.bitwise_and(line_mask, spatial_mask))
-        total_px = np.count_nonzero(line_mask)
-        print(f"  [Stage 4] Baseline anchor: x=[{bl_x_left},{bl_x_right}], "
-              f"spatial mask kept {masked_px}/{total_px} line pixels")
-    else:
-        print(f"  [Stage 4] No baseline found — using unmasked detection")
-    horizontal, vertical = classify_lines_courtside(raw_lines, baseline_angle=bl_angle)
-    horizontal = filter_short_merged(merge_collinear_segments(horizontal))
-    vertical = filter_short_merged(merge_collinear_segments(vertical))
-    print(f"  [Stage 4] Hough: {n_raw} raw → {len(horizontal)}H + {len(vertical)}V "
-          f"merged ({time.time()-t4:.2f}s)")
-
     # --- Stage 4b: Multi-candidate scoring (Agrawal Section 3.4) ---
     t4b = time.time()
     nh_h, nh_w = near_half.shape[:2]
+    hsv = cv2.cvtColor(near_half, cv2.COLOR_BGR2HSV)
+    gray = cv2.cvtColor(near_half, cv2.COLOR_BGR2GRAY)
 
     # Helper: run a candidate line mask through the full pipeline to homography.
     # Each candidate computes its own baseline extent so a weak saturation
@@ -2798,9 +2514,6 @@ def run_agrawal_pipeline(
         c_raw, c_bl_ext, c_sm, c_bl_angle = detect_lines_near_half(cand_line_mask)
         if c_bl_ext is not None:
             cand_line_mask = cv2.bitwise_and(cand_line_mask, c_sm)
-            c_raw, _, _, c_bl_angle2 = detect_lines_near_half(cand_line_mask)
-            if c_bl_angle2 is not None:
-                c_bl_angle = c_bl_angle2
             bl_span = c_bl_ext[1] - c_bl_ext[0]
             print(f"  [Stage 4b] {cand_label}: baseline x=[{c_bl_ext[0]},{c_bl_ext[1]}], "
                   f"span={bl_span}px ({bl_span/nh_w*100:.0f}%)")
@@ -2812,7 +2525,9 @@ def run_agrawal_pipeline(
         c_near_kps = compute_near_half_keypoints(c_identified, y_offset, c_v, nh_h)
         c_near_kps = validate_near_half_keypoints(c_near_kps)
         c_H, c_near_kps = compute_near_half_homography(c_near_kps)
-        c_score = score_court_detection(near_half, c_H, y_offset, cand_line_mask) if c_H is not None else 0
+        c_score = score_court_detection(
+            near_half, c_H, y_offset, cand_line_mask, gray=gray, hsv=hsv
+        ) if c_H is not None else 0
         c_err = reprojection_error(c_near_kps, c_H) if c_H is not None else float('inf')
         n = 0 if c_raw is None else len(c_raw)
         print(f"  [Stage 4b] {cand_label}: {len(c_h)}H+{len(c_v)}V, "
@@ -2822,20 +2537,46 @@ def run_agrawal_pipeline(
     candidates = []
 
     # Candidate 1: Local-contrast AND filter (primary)
-    lc_line_mask, lc_court_mask, _, lc_thresh_v, lc_thresh_s = agrawal_local_contrast_line_filter(near_half)
+    lc_line_mask, lc_court_mask, lc_hsv, lc_thresh_v, lc_thresh_s = agrawal_local_contrast_line_filter(
+        near_half, hsv=hsv
+    )
     lc_line_px = np.count_nonzero(lc_line_mask)
+    court_px = lc_hsv[lc_court_mask > 0]
+    if len(court_px) > 0:
+        court_h = int(np.median(court_px[:, 0]))
+        court_s = int(np.median(court_px[:, 1]))
+        court_v = int(np.median(court_px[:, 2]))
+    else:
+        court_h, court_s, court_v = 0, 0, 0
+    court_color = np.array([court_h, court_s, court_v], dtype=np.uint8)
+    if court_s < 40:
+        court_type = "unknown"
+    elif 90 <= court_h <= 125:
+        court_type = "blue"
+    elif 35 <= court_h <= 85:
+        court_type = "green"
+    elif court_h <= 25 or court_h >= 170:
+        court_type = "clay"
+    else:
+        court_type = "unknown"
     print(f"  [Stage 2+3] LocalContrast: {lc_line_px} line pixels, "
-          f"thresh_v={lc_thresh_v}, thresh_s={lc_thresh_s}")
+          f"thresh_v={lc_thresh_v}, thresh_s={lc_thresh_s}, "
+          f"court={court_type}(H={court_h} S={court_s} V={court_v})")
     c1 = _run_candidate(lc_line_mask, "LocalContrast")
     candidates.append(("local_contrast", c1, lc_court_mask, court_color, "local_contrast"))
 
-    # Candidate 2: CLAHE-enhanced filter (night / low-contrast scenes)
-    cl_line_mask, cl_court_mask, _, cl_thresh_v = agrawal_clahe_line_filter(near_half)
-    cl_line_px = np.count_nonzero(cl_line_mask)
-    print(f"  [Stage 2+3] CLAHE: {cl_line_px} line pixels, "
-          f"thresh_v={cl_thresh_v}")
-    c2 = _run_candidate(cl_line_mask, "CLAHE")
-    candidates.append(("clahe", c2, cl_court_mask, court_color, "clahe"))
+    CLAHE_SKIP_THRESHOLD = 1500
+    lc_score = c1[7]  # score is index 7 of _run_candidate result
+    if lc_score > CLAHE_SKIP_THRESHOLD:
+        print(f"  [Stage 4b] Skipping CLAHE (LC score={lc_score} > {CLAHE_SKIP_THRESHOLD})")
+    else:
+        # Candidate 2: CLAHE-enhanced filter (night / low-contrast scenes)
+        cl_line_mask, cl_court_mask, _, cl_thresh_v = agrawal_clahe_line_filter(near_half, hsv=hsv)
+        cl_line_px = np.count_nonzero(cl_line_mask)
+        print(f"  [Stage 2+3] CLAHE: {cl_line_px} line pixels, "
+              f"thresh_v={cl_thresh_v}")
+        c2 = _run_candidate(cl_line_mask, "CLAHE")
+        candidates.append(("clahe", c2, cl_court_mask, court_color, "clahe"))
 
     # Pick best candidate: among those with score > 0, choose lowest reproj error
     valid_candidates = [(name, cand, cm, cc, mode) for name, cand, cm, cc, mode in candidates
@@ -2866,6 +2607,12 @@ def run_agrawal_pipeline(
         pre_filter_verticals = lc_cand[9]
         line_mask = lc_cand[6]
         identified = lc_cand[2]
+        raw_lines = lc_cand[5]
+        n_raw = 0 if raw_lines is None else len(raw_lines)
+        court_color_mask = best_lc[2]
+        court_color = best_lc[3]
+        best_H = lc_cand[0]
+        best_near_kps = lc_cand[1]
         winning_court_mode = "local_contrast"
 
     # --- Stage 5: Identify near-half lines (already computed in 4b) ---
@@ -2891,47 +2638,29 @@ def run_agrawal_pipeline(
 
     # --- Stage 6: Compute near-half keypoints ---
     t6 = time.time()
-    near_kps = compute_near_half_keypoints(identified, y_offset, vertical, nh_h)
-    near_kps = validate_near_half_keypoints(near_kps)
+    if used_sv_fallback:
+        near_kps = compute_near_half_keypoints(identified, y_offset, vertical, nh_h)
+        near_kps = validate_near_half_keypoints(near_kps)
+        H_near = None
+    else:
+        near_kps = list(best_near_kps)
+        H_near = best_H
     print(f"  [Stage 6] Near-half keypoints: {len(near_kps)}")
     for kp_idx, (px, py) in near_kps:
         name = KP_NAMES[kp_idx] if kp_idx < len(KP_NAMES) else f"KP{kp_idx}"
         print(f"    KP{kp_idx} ({name}): ({px:.1f}, {py:.1f})")
 
-    # --- Stage 7: Homography + PnL refinement + extend ---
+    # --- Stage 7: Homography + extend ---
     t7 = time.time()
-    H_near, near_kps = compute_near_half_homography(near_kps)
+    if used_sv_fallback:
+        H_near, near_kps = compute_near_half_homography(near_kps)
     H_full = None
     H_full_raw = None
     all_kps = list(near_kps)
 
     if H_near is not None:
-        print(f"  [Stage 7] --- Initial H (from keypoints only) ---")
-        debug_per_line_chamfer(H_near, line_mask, y_offset, label="InitH")
-
-        # Edge-align with keypoint regularization (RANSAC-cleaned KPs are trustworthy)
-        H_near = refine_homography_edge_align(
-            H_near, line_mask, near_kps, y_offset,
-            lambda_reg=0.3, max_iter=150)
-
-        # Debug: per-line chamfer AFTER edge-align
-        print(f"  [Stage 7] --- After edge-align (lambda_reg=0.3) ---")
-        debug_per_line_chamfer(H_near, line_mask, y_offset, label="PostEdge")
-
-        # Update keypoints from edge-aligned H so PnL uses corrected positions
-        try:
-            H_inv = np.linalg.inv(H_near)
-            meter_pts = np.array([REFERENCE_KPS_METERS[idx] for idx, _ in near_kps],
-                                 dtype=np.float64).reshape(-1, 1, 2)
-            updated_px = cv2.perspectiveTransform(meter_pts, H_inv).reshape(-1, 2)
-            near_kps = [(idx, (float(updated_px[i, 0]), float(updated_px[i, 1])))
-                        for i, (idx, _) in enumerate(near_kps)]
-            print(f"  [Stage 7] Updated {len(near_kps)} KPs from edge-aligned H")
-        except (np.linalg.LinAlgError, cv2.error):
-            print(f"  [Stage 7] Could not update KPs (singular H), keeping originals")
-
         H_full, all_kps = extend_to_full_court(H_near, near_kps)
-        H_full_raw = H_full  # keep raw for comparison
+        H_full_raw = H_full
         near_err = reprojection_error(near_kps, H_full) if H_full is not None else float("inf")
         full_err = reprojection_error(all_kps, H_full) if H_full is not None else float("inf")
         print(f"  [Stage 7] Homography computed: near_err={near_err:.1f}px, "
@@ -2948,18 +2677,6 @@ def run_agrawal_pipeline(
             near_kps = validate_near_half_keypoints(near_kps)
             H_near, near_kps = compute_near_half_homography(near_kps)
             if H_near is not None:
-                H_near = refine_homography_edge_align(
-                    H_near, line_mask, near_kps, y_offset,
-                    lambda_reg=0.3, max_iter=150)
-                try:
-                    H_inv = np.linalg.inv(H_near)
-                    meter_pts = np.array([REFERENCE_KPS_METERS[idx] for idx, _ in near_kps],
-                                         dtype=np.float64).reshape(-1, 1, 2)
-                    updated_px = cv2.perspectiveTransform(meter_pts, H_inv).reshape(-1, 2)
-                    near_kps = [(idx, (float(updated_px[i, 0]), float(updated_px[i, 1])))
-                                for i, (idx, _) in enumerate(near_kps)]
-                except (np.linalg.LinAlgError, cv2.error):
-                    pass
                 H_full, all_kps = extend_to_full_court(H_near, near_kps)
                 H_full_raw = H_full
                 near_err = reprojection_error(near_kps, H_full) if H_full is not None else float("inf")
