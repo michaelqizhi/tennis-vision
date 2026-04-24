@@ -17,6 +17,7 @@ from src.features.court_detect.court_template import REFERENCE_KPS_METERS
 from src.features.court_detect.shadow_removal import ShadowRemover
 
 FRAME_W, FRAME_H = 1920, 1080
+_VERBOSE = True  # Set False for production/batch processing
 
 # Court geometry (ITF, meters from net center origin)
 NET_Y_METERS = 0.0
@@ -69,8 +70,14 @@ HOUGH_THRESHOLD = 30
 HOUGH_MIN_LENGTH = 30
 HOUGH_MAX_GAP = 40
 MIN_MERGED_LENGTH = 200
+MAX_MERGE_SEGMENTS = 50
 MERGE_DEBUG = False
 MERGE_DEBUG_X_RANGE = (400.0, 800.0)
+
+
+def _log(msg: str) -> None:
+    if _VERBOSE:
+        print(msg)
 # ===================================================================
 # Stage 1: Net detection / near-half crop
 # ===================================================================
@@ -163,71 +170,23 @@ def crop_near_half(
     return cropped, y_start
 
 
-# ===================================================================
-# Stage 2: Agrawal court-line filter
-# ===================================================================
-
 def agrawal_saturation_line_filter(
     frame_bgr: np.ndarray,
-    neighborhood: int = NEIGHBORHOOD_SIZE,
-    min_court_neighbors: int = MIN_COURT_NEIGHBORS,
-    sat_court_thresh: int = SAT_COURT_THRESHOLD,
-    sat_line_s_max: int = SAT_LINE_S_MAX,
-    sat_line_v_min: int = SAT_LINE_V_MIN,
     tophat_ksize: int = TOPHAT_KERNEL_SIZE,
-    tophat_thresh: int = TOPHAT_THRESHOLD,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
-    """Color-agnostic Agrawal filter using white top-hat + saturation gate.
+    """Saturation-based line filter (legacy — kept for diagnostic scripts).
 
-    White top-hat on V channel extracts only thin bright features (lines),
-    naturally ignoring large bright areas (court surface, overexposure).
-    Saturation gate ensures detected features are on a chromatic surface
-    (court/surround), not sky or background.
-
-    Works on any court color combination and any court brightness.
-
-    Returns (line_mask, court_mask, hsv) where masks are uint8 binary (0/255)
-    and hsv is the precomputed HSV image.
+    Prefer agrawal_local_contrast_line_filter() for production use.
     """
     hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
-    S = hsv[:, :, 1]
     V = hsv[:, :, 2]
-
-    # White top-hat: extracts thin bright features smaller than kernel
-    # Court surface (large, uniform) is suppressed; lines (thin, bright) survive
-    kernel_morph = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
-                                             (tophat_ksize, tophat_ksize))
-    tophat = cv2.morphologyEx(V, cv2.MORPH_TOPHAT, kernel_morph)
-
-    # Adaptive top-hat threshold using Otsu on court-region top-hat values.
-    # This handles both bright courts (low top-hat response ~6) and dark
-    # courts (high top-hat response ~100) without a fixed threshold.
-    court_region = (S > sat_court_thresh)
-    tophat_court = tophat[court_region]
-    if len(tophat_court) > 100:
-        otsu_thresh, _ = cv2.threshold(tophat_court, 0, 255,
-                                        cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        # Use the higher of Otsu and a minimum floor to avoid noise
-        effective_tophat_thresh = max(int(otsu_thresh * 0.7), 5)
-    else:
-        effective_tophat_thresh = tophat_thresh
-
-    # Line candidate: strong top-hat response AND achromatic AND bright
-    line_candidate = ((tophat > effective_tophat_thresh) &
-                      (S < sat_line_s_max) &
-                      (V > sat_line_v_min))
-
-    # Court surface = any chromatic pixel (for neighbor counting)
-    court_mask = (S > sat_court_thresh).astype(np.uint8) * 255
-
-    # Agrawal neighbor logic: line pixel must be surrounded by court pixels
-    court_01 = (court_mask > 0).astype(np.float32)
-    kernel = np.ones((neighborhood, neighborhood), dtype=np.float32)
-    neighbor_count = cv2.filter2D(court_01, cv2.CV_32F, kernel)
-    has_neighbors = (neighbor_count >= min_court_neighbors)
-
-    line_mask = (line_candidate & has_neighbors).astype(np.uint8) * 255
-    return line_mask, court_mask, hsv, effective_tophat_thresh
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (tophat_ksize, tophat_ksize))
+    tophat_v = cv2.morphologyEx(V, cv2.MORPH_TOPHAT, kernel)
+    otsu_val, _ = cv2.threshold(tophat_v, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+    thresh = max(int(otsu_val * 0.7), 5)
+    line_mask = (tophat_v > thresh).astype(np.uint8) * 255
+    court_mask = (V > 30).astype(np.uint8) * 255
+    return line_mask, court_mask, hsv, thresh
 
 
 def agrawal_local_contrast_line_filter(
@@ -452,6 +411,13 @@ def estimate_vanishing_point(lines: list[np.ndarray]) -> np.ndarray | None:
     if len(lines) < 2:
         return None
 
+    if len(lines) > 20:
+        lines = sorted(
+            lines,
+            key=lambda s: np.hypot(s[2] - s[0], s[3] - s[1]),
+            reverse=True,
+        )[:20]
+
     intersections = []
     for i in range(len(lines)):
         for j in range(i + 1, len(lines)):
@@ -585,7 +551,7 @@ def merge_collinear_segments(
 
             if adiff > angle_tol:
                 if debug_pair:
-                    print(
+                    _log(
                         f"    [MergeDebug] pair i={i} j={j} "
                         f"seg_i={tuple(int(v) for v in segments[i])} "
                         f"seg_j={tuple(int(v) for v in segments[j])} "
@@ -614,7 +580,7 @@ def merge_collinear_segments(
 
             if max_dist >= effective_tol:
                 if debug_pair:
-                    print(
+                    _log(
                         f"    [MergeDebug] pair i={i} j={j} "
                         f"seg_i={tuple(int(v) for v in segments[i])} "
                         f"seg_j={tuple(int(v) for v in segments[j])} "
@@ -636,7 +602,7 @@ def merge_collinear_segments(
 
             if ep_gap > max_gap:
                 if debug_pair:
-                    print(
+                    _log(
                         f"    [MergeDebug] pair i={i} j={j} "
                         f"seg_i={tuple(int(v) for v in segments[i])} "
                         f"seg_j={tuple(int(v) for v in segments[j])} "
@@ -646,7 +612,7 @@ def merge_collinear_segments(
                 continue
 
             if debug_pair:
-                print(
+                _log(
                     f"    [MergeDebug] pair i={i} j={j} "
                     f"seg_i={tuple(int(v) for v in segments[i])} "
                     f"seg_j={tuple(int(v) for v in segments[j])} "
@@ -686,12 +652,12 @@ def merge_collinear_segments(
         intervals.sort(key=lambda x: x[0])
         debug_group = MERGE_DEBUG and any(_debug_center(s) for s in group)
         if debug_group:
-            print(
+            _log(
                 f"    [MergeDebug] group root={root} size={len(group)} "
                 f"members={member_indices} best={tuple(int(v) for v in best)}"
             )
             for idx_interval, (lo, hi, pt_lo, pt_hi, _oi) in enumerate(intervals):
-                print(
+                _log(
                     f"    [MergeDebug] interval {idx_interval}: "
                     f"lo={lo:.2f} hi={hi:.2f} "
                     f"pt_lo={tuple(int(v) for v in pt_lo)} "
@@ -705,7 +671,7 @@ def merge_collinear_segments(
             prev_lo, prev_hi, prev_pt_lo, prev_pt_hi, prev_members = clusters[-1]
             gap = lo - prev_hi
             if debug_group:
-                print(
+                _log(
                     f"    [MergeDebug] interval_gap prev_hi={prev_hi:.2f} lo={lo:.2f} "
                     f"gap={gap:.2f} max_gap={max_gap:.2f} -> "
                     f"{'MERGE' if gap <= max_gap else 'SPLIT'}"
@@ -935,16 +901,22 @@ def detect_lines_near_half(
     # --- Pass 1: Find the baseline extent ---
     pass1_lines = cv2.HoughLinesP(
         cleaned, 1, np.pi / 180,
-        threshold=hough_threshold,
-        minLineLength=min_length,
+        threshold=max(hough_threshold, 50),
+        minLineLength=max(min_length, 80),
         maxLineGap=max_gap,
     )
 
     bl_result = _find_baseline_extent(pass1_lines, h, w)
 
     if bl_result is None:
-        # No baseline found — fall back to unmasked detection
-        return pass1_lines, None, None, None
+        # No baseline found — fall back to unmasked detection with original params
+        fallback_lines = cv2.HoughLinesP(
+            cleaned, 1, np.pi / 180,
+            threshold=hough_threshold,
+            minLineLength=min_length,
+            maxLineGap=max_gap,
+        )
+        return fallback_lines, None, None, None
 
     baseline_extent = (bl_result[0], bl_result[1])
     baseline_angle = bl_result[2]
@@ -952,9 +924,15 @@ def detect_lines_near_half(
     # Reject baseline extents too narrow to produce useful spatial masks
     extent_span = baseline_extent[1] - baseline_extent[0]
     if extent_span < w * MIN_BASELINE_EXTENT_FRAC:
-        print(f"    [ExtentGuard] Rejected: span={extent_span}px "
-              f"({extent_span/w:.0%} < {MIN_BASELINE_EXTENT_FRAC:.0%})")
-        return pass1_lines, None, None, baseline_angle
+        _log(f"    [ExtentGuard] Rejected: span={extent_span}px "
+             f"({extent_span/w:.0%} < {MIN_BASELINE_EXTENT_FRAC:.0%})")
+        fallback_lines = cv2.HoughLinesP(
+            cleaned, 1, np.pi / 180,
+            threshold=hough_threshold,
+            minLineLength=min_length,
+            maxLineGap=max_gap,
+        )
+        return fallback_lines, None, None, baseline_angle
 
     # --- Create spatial mask from baseline extent ---
     spatial_mask = create_court_spatial_mask(baseline_extent, h, w)
@@ -1090,11 +1068,11 @@ def find_center_service_line(
 
             length = np.hypot(seg[2] - seg[0], seg[3] - seg[1])
             if length < min_length:
-                print(f"    [CenterService] Gate 2 reject: length={length:.0f} < {min_length:.0f}")
+                _log(f"    [CenterService] Gate 2 reject: length={length:.0f} < {min_length:.0f}")
                 continue
 
             if id(seg) in sideline_ids:
-                print(f"    [CenterService] Gate 3 reject: segment already matched as sideline")
+                _log("    [CenterService] Gate 3 reject: segment already matched as sideline")
                 continue
 
             if seg[1] >= seg[3]:
@@ -1104,7 +1082,7 @@ def find_center_service_line(
 
             service_y_ratio = bottom_y / bl_y
             if service_y_ratio < 0.23 or service_y_ratio > 0.42:
-                print(f"    [CenterService] Gate 4 reject: y_ratio={service_y_ratio:.2f} outside [0.23, 0.42]")
+                _log(f"    [CenterService] Gate 4 reject: y_ratio={service_y_ratio:.2f} outside [0.23, 0.42]")
                 continue
 
             candidates.append((abs(t - 0.5), bottom_y, t, seg))
@@ -1129,7 +1107,7 @@ def find_center_service_line(
         return None
 
     t_score, bottom_y, t, seg = winner
-    print(f"    [CenterService] Selected ({source}): t_score={t_score:.3f}, bottom_y={bottom_y:.0f}, t={t:.3f}")
+    _log(f"    [CenterService] Selected ({source}): t_score={t_score:.3f}, bottom_y={bottom_y:.0f}, t={t:.3f}")
     return seg
 
 
@@ -1203,20 +1181,19 @@ def identify_near_half_lines(
                 bl_y = _line_y_at_x(baseline_seg, cx)
                 result["near_baseline"] = baseline_seg
                 n = g["n_fragments"]
-                print(f"    [Baseline] Accepted group ({n} fragment{'s' if n > 1 else ''}): "
-                      f"xspan={span:.0f} ({span/frame_width:.0%})")
+                _log(f"    [Baseline] Accepted group ({n} fragment{'s' if n > 1 else ''}): "
+                     f"xspan={span:.0f} ({span/frame_width:.0%})")
                 break
             else:
-                print(f"    [Baseline] Rejected group: xspan={span:.0f} < {min_bl_span:.0f} "
-                      f"({span/frame_width:.0%} < {MIN_BASELINE_FRAC:.0%})")
+                _log(f"    [Baseline] Rejected group: xspan={span:.0f} < {min_bl_span:.0f} "
+                     f"({span/frame_width:.0%} < {MIN_BASELINE_FRAC:.0%})")
 
         if baseline_seg is None:
-            print(f"    [Baseline] No group spans ≥{MIN_BASELINE_FRAC:.0%} of frame")
+            _log(f"    [Baseline] No group spans ≥{MIN_BASELINE_FRAC:.0%} of frame")
             result["near_baseline"] = None
 
     # --- Vertical lines (baseline-intersection matching with court proportions) ---
     bl = result.get("near_baseline")
-    scored_v = []
     if len(vertical) >= 1 and bl is not None:
         if bl_y is not None:
             min_vline_length = bl_y * 0.85
@@ -1239,11 +1216,6 @@ def identify_near_half_lines(
                 continue
             t = (pt[0] - bl_left_x) / bl_span
             candidates.append((t, seg))
-            ref_y = frame_height * 0.8
-            x_at_ref = _line_x_at_y(seg, ref_y)
-            if x_at_ref is not None:
-                scored_v.append((x_at_ref, length, seg))
-        scored_v.sort(key=lambda x: x[0])
 
         # --- VP consistency filter ---
         VP_DIST_THRESH = 50  # pixels
@@ -1260,9 +1232,9 @@ def identify_near_half_lines(
                     if dist < VP_DIST_THRESH:
                         vp_filtered.append((t, seg))
                     else:
-                        print(f"    [VP-filter] Rejected t={t:.2f}, VP-dist={dist:.1f}px")
+                        _log(f"    [VP-filter] Rejected t={t:.2f}, VP-dist={dist:.1f}px")
                 if len(vp_filtered) >= 2:
-                    print(f"    [VP-filter] Kept {len(vp_filtered)}/{len(candidates)} candidates")
+                    _log(f"    [VP-filter] Kept {len(vp_filtered)}/{len(candidates)} candidates")
                     candidates = vp_filtered
 
         # Expected normalized positions from ITF court proportions
@@ -1301,12 +1273,12 @@ def identify_near_half_lines(
                 result[role] = candidates[best_idx][1]
                 matched_t[role] = candidates[best_idx][0]
                 best_t = candidates[best_idx][0]
-                print(f"    [Sideline] {role}: t={best_t:.2f} "
-                      f"(expected {exp_t:.2f}, dist={abs(best_t - exp_t):.2f})")
+                _log(f"    [Sideline] {role}: t={best_t:.2f} "
+                     f"(expected {exp_t:.2f}, dist={abs(best_t - exp_t):.2f})")
 
         for i, (t, seg) in enumerate(candidates):
             if i not in assigned:
-                print(f"    [Sideline] Unmatched vertical at t={t:.2f} (no role within tolerance)")
+                _log(f"    [Sideline] Unmatched vertical at t={t:.2f} (no role within tolerance)")
 
         # --- Post-processing: reassign lone sidelines for off-frame courts ---
         ld, ls = result["left_doubles"], result["left_singles"]
@@ -1317,9 +1289,9 @@ def identify_near_half_lines(
             right_gap = matched_t["right_doubles"] - matched_t["right_singles"]
             expected_ls_t = matched_t["left_doubles"] + right_gap
             if 0 <= expected_ls_t <= 1:
-                print(f"    [Sideline] Reassign left_doubles→left_singles: "
-                      f"companion expected at t={expected_ls_t:.2f} (in-frame but missing), "
-                      f"right gap={right_gap:.2f}")
+                _log(f"    [Sideline] Reassign left_doubles→left_singles: "
+                     f"companion expected at t={expected_ls_t:.2f} (in-frame but missing), "
+                     f"right gap={right_gap:.2f}")
                 result["left_singles"] = result["left_doubles"]
                 result["left_doubles"] = None
 
@@ -1328,9 +1300,9 @@ def identify_near_half_lines(
             left_gap = matched_t["left_singles"] - matched_t["left_doubles"]
             expected_rs_t = matched_t["right_doubles"] - left_gap
             if 0 <= expected_rs_t <= 1:
-                print(f"    [Sideline] Reassign right_doubles→right_singles: "
-                      f"companion expected at t={expected_rs_t:.2f} (in-frame but missing), "
-                      f"left gap={left_gap:.2f}")
+                _log(f"    [Sideline] Reassign right_doubles→right_singles: "
+                     f"companion expected at t={expected_rs_t:.2f} (in-frame but missing), "
+                     f"left gap={left_gap:.2f}")
                 result["right_singles"] = result["right_doubles"]
                 result["right_doubles"] = None
 
@@ -1338,7 +1310,7 @@ def identify_near_half_lines(
         ld, ls = result["left_doubles"], result["left_singles"]
         rd, rs = result["right_doubles"], result["right_singles"]
         if ld is not None and ls is None and rd is not None and rs is None:
-            print(f"    [Sideline] One line per side, defaulting both to singles")
+            _log("    [Sideline] One line per side, defaulting both to singles")
             result["left_singles"] = result["left_doubles"]
             result["left_doubles"] = None
             result["right_singles"] = result["right_doubles"]
@@ -1364,13 +1336,13 @@ def identify_near_half_lines(
             candidate_y = y_at_cx
             y_ratio = (bl_y - candidate_y) / bl_y if bl_y > 0 else 0.0
             if y_ratio < 0.30 or y_ratio > 0.78:
-                print(f"    [Service] Rejected: y_ratio={y_ratio:.2f} outside [0.30, 0.78]")
+                _log(f"    [Service] Rejected: y_ratio={y_ratio:.2f} outside [0.30, 0.78]")
                 continue
 
             # Constraint 2: Width ≤ baseline
             candidate_xspan = abs(seg[2] - seg[0])
             if candidate_xspan > baseline_xspan:
-                print(f"    [Service] Rejected: xspan={candidate_xspan:.0f} > baseline={baseline_xspan:.0f}")
+                _log(f"    [Service] Rejected: xspan={candidate_xspan:.0f} > baseline={baseline_xspan:.0f}")
                 continue
 
             # Constraint 3: Angle within 10° of baseline
@@ -1379,7 +1351,7 @@ def identify_near_half_lines(
             if angle_diff > 90:
                 angle_diff = 180 - angle_diff
             if angle_diff >= 10:
-                print(f"    [Service] Rejected: angle_diff={angle_diff:.1f}° >= 10°")
+                _log(f"    [Service] Rejected: angle_diff={angle_diff:.1f}° >= 10°")
                 continue
 
             # Constraint 4: Sideline endpoint test (when sidelines detected)
@@ -1407,20 +1379,20 @@ def identify_near_half_lines(
                     dist_left = _point_to_line_dist(lx, ly, left_sl)
                     dist_right = _point_to_line_dist(rx, ry, right_sl)
                     if dist_left > tolerance or dist_right > tolerance:
-                        print(f"    [Service] Rejected: sideline dist L={dist_left:.1f} R={dist_right:.1f} "
-                              f"(tol={tolerance:.1f})")
+                        _log(f"    [Service] Rejected: sideline dist L={dist_left:.1f} R={dist_right:.1f} "
+                             f"(tol={tolerance:.1f})")
                         sideline_ok = False
                 elif left_sl is not None:
                     dist_left = _point_to_line_dist(lx, ly, left_sl)
                     if dist_left > tolerance:
-                        print(f"    [Service] Rejected: left sideline dist={dist_left:.1f} "
-                              f"(tol={tolerance:.1f})")
+                        _log(f"    [Service] Rejected: left sideline dist={dist_left:.1f} "
+                             f"(tol={tolerance:.1f})")
                         sideline_ok = False
                 elif right_sl is not None:
                     dist_right = _point_to_line_dist(rx, ry, right_sl)
                     if dist_right > tolerance:
-                        print(f"    [Service] Rejected: right sideline dist={dist_right:.1f} "
-                              f"(tol={tolerance:.1f})")
+                        _log(f"    [Service] Rejected: right sideline dist={dist_right:.1f} "
+                             f"(tol={tolerance:.1f})")
                         sideline_ok = False
 
                 if not sideline_ok:
@@ -1432,9 +1404,9 @@ def identify_near_half_lines(
             # Constraint 5: Pick closest to expected y-position, NOT longest
             service_candidates.sort(key=lambda c: abs(c[0] - expected_y))
             result["near_service"] = service_candidates[0][2]
-            print(f"    [Service] Selected: y={service_candidates[0][0]:.0f} "
-                  f"(expected={expected_y:.0f}, "
-                  f"y_ratio={(bl_y - service_candidates[0][0]) / bl_y:.2f})")
+            _log(f"    [Service] Selected: y={service_candidates[0][0]:.0f} "
+                 f"(expected={expected_y:.0f}, "
+                 f"y_ratio={(bl_y - service_candidates[0][0]) / bl_y:.2f})")
 
     return result
 
@@ -1907,10 +1879,7 @@ def is_convex_quadrilateral(points: list[tuple[float, float]]) -> bool:
 
 def draw_pipeline_stages(
     original_frame: np.ndarray,
-    net_y: int,
     near_half: np.ndarray,
-    court_color_hsv: np.ndarray,
-    court_color_mask: np.ndarray,
     line_mask: np.ndarray,
     horizontal: list[np.ndarray],
     vertical: list[np.ndarray],
@@ -2413,7 +2382,6 @@ def score_court_detection(
     near_half: np.ndarray,
     H_near: np.ndarray,
     y_offset: int = 0,
-    line_mask: np.ndarray | None = None,
     gray: np.ndarray | None = None,
     hsv: np.ndarray | None = None,
 ) -> int:
@@ -2465,6 +2433,7 @@ def run_agrawal_pipeline(
     net_detector=None,
     output_dir: Path | None = None,
     video_stem: str = "",
+    diagnostic: bool = True,
 ) -> dict:
     """Run the full Agrawal-inspired pipeline on a single frame."""
     t0 = time.time()
@@ -2474,12 +2443,12 @@ def run_agrawal_pipeline(
     t1 = time.time()
     net_y, net_source, crop_margin = estimate_net_y(
         frame, net_detector=net_detector)
-    print(f"  [Stage 1] Net y={net_y} (source={net_source}), "
-          f"margin={crop_margin} ({time.time()-t1:.2f}s)")
+    _log(f"  [Stage 1] Net y={net_y} (source={net_source}), "
+         f"margin={crop_margin} ({time.time()-t1:.2f}s)")
 
     near_half, y_offset = crop_near_half(frame, net_y, margin=crop_margin)
-    print(f"  [Stage 1] Near-half crop: {near_half.shape[1]}×{near_half.shape[0]}, "
-          f"y_offset={y_offset}")
+    _log(f"  [Stage 1] Near-half crop: {near_half.shape[1]}×{near_half.shape[0]}, "
+         f"y_offset={y_offset}")
 
     # --- Stage 1.5: Shadow removal (optional, with auto-gating) ---
     if shadow_remover is not None:
@@ -2487,18 +2456,18 @@ def run_agrawal_pipeline(
         should_apply, discrim, shadow_ratio = ShadowRemover.should_remove_shadows(near_half)
         if should_apply:
             near_half_sr = shadow_remover.remove_shadows(near_half)
-            print(f"  [Stage 1.5] Shadow removal APPLIED "
-                  f"(discrim={discrim:.3f}, shadow_ratio={shadow_ratio:.2f}, "
-                  f"{time.time()-t_sr:.3f}s)")
+            _log(f"  [Stage 1.5] Shadow removal APPLIED "
+                 f"(discrim={discrim:.3f}, shadow_ratio={shadow_ratio:.2f}, "
+                 f"{time.time()-t_sr:.3f}s)")
             if output_dir is not None:
                 diag_path = output_dir / f"shadow_removal_{video_stem}_frame_{frame_idx}.jpg"
                 diag = np.hstack([near_half, near_half_sr])
                 cv2.imwrite(str(diag_path), diag)
             near_half = near_half_sr
         else:
-            print(f"  [Stage 1.5] Shadow removal SKIPPED "
-                  f"(discrim={discrim:.3f}, shadow_ratio={shadow_ratio:.2f}, "
-                  f"{time.time()-t_sr:.3f}s)")
+            _log(f"  [Stage 1.5] Shadow removal SKIPPED "
+                 f"(discrim={discrim:.3f}, shadow_ratio={shadow_ratio:.2f}, "
+                 f"{time.time()-t_sr:.3f}s)")
 
     # --- Stage 4b: Multi-candidate scoring (Agrawal Section 3.4) ---
     t4b = time.time()
@@ -2515,9 +2484,21 @@ def run_agrawal_pipeline(
         if c_bl_ext is not None:
             cand_line_mask = cv2.bitwise_and(cand_line_mask, c_sm)
             bl_span = c_bl_ext[1] - c_bl_ext[0]
-            print(f"  [Stage 4b] {cand_label}: baseline x=[{c_bl_ext[0]},{c_bl_ext[1]}], "
-                  f"span={bl_span}px ({bl_span/nh_w*100:.0f}%)")
+            _log(f"  [Stage 4b] {cand_label}: baseline x=[{c_bl_ext[0]},{c_bl_ext[1]}], "
+                 f"span={bl_span}px ({bl_span/nh_w*100:.0f}%)")
         c_h, c_v = classify_lines_courtside(c_raw, baseline_angle=c_bl_angle)
+        if len(c_h) > MAX_MERGE_SEGMENTS:
+            c_h = sorted(
+                c_h,
+                key=lambda s: np.hypot(s[2] - s[0], s[3] - s[1]),
+                reverse=True,
+            )[:MAX_MERGE_SEGMENTS]
+        if len(c_v) > MAX_MERGE_SEGMENTS:
+            c_v = sorted(
+                c_v,
+                key=lambda s: np.hypot(s[2] - s[0], s[3] - s[1]),
+                reverse=True,
+            )[:MAX_MERGE_SEGMENTS]
         c_h = filter_short_merged(merge_collinear_segments(c_h))
         c_v_merged = merge_collinear_segments(c_v)
         c_v = filter_short_merged(c_v_merged)
@@ -2526,12 +2507,11 @@ def run_agrawal_pipeline(
         c_near_kps = validate_near_half_keypoints(c_near_kps)
         c_H, c_near_kps = compute_near_half_homography(c_near_kps)
         c_score = score_court_detection(
-            near_half, c_H, y_offset, cand_line_mask, gray=gray, hsv=hsv
+            near_half, c_H, y_offset, gray=gray, hsv=hsv
         ) if c_H is not None else 0
         c_err = reprojection_error(c_near_kps, c_H) if c_H is not None else float('inf')
-        n = 0 if c_raw is None else len(c_raw)
-        print(f"  [Stage 4b] {cand_label}: {len(c_h)}H+{len(c_v)}V, "
-              f"{len(c_near_kps)} kps, score={c_score}, reproj={c_err:.1f}px")
+        _log(f"  [Stage 4b] {cand_label}: {len(c_h)}H+{len(c_v)}V, "
+             f"{len(c_near_kps)} kps, score={c_score}, reproj={c_err:.1f}px")
         return c_H, c_near_kps, c_identified, c_h, c_v, c_raw, cand_line_mask, c_score, c_err, c_v_merged
 
     candidates = []
@@ -2559,22 +2539,22 @@ def run_agrawal_pipeline(
         court_type = "clay"
     else:
         court_type = "unknown"
-    print(f"  [Stage 2+3] LocalContrast: {lc_line_px} line pixels, "
-          f"thresh_v={lc_thresh_v}, thresh_s={lc_thresh_s}, "
-          f"court={court_type}(H={court_h} S={court_s} V={court_v})")
+    _log(f"  [Stage 2+3] LocalContrast: {lc_line_px} line pixels, "
+         f"thresh_v={lc_thresh_v}, thresh_s={lc_thresh_s}, "
+         f"court={court_type}(H={court_h} S={court_s} V={court_v})")
     c1 = _run_candidate(lc_line_mask, "LocalContrast")
     candidates.append(("local_contrast", c1, lc_court_mask, court_color, "local_contrast"))
 
     CLAHE_SKIP_THRESHOLD = 1500
     lc_score = c1[7]  # score is index 7 of _run_candidate result
     if lc_score > CLAHE_SKIP_THRESHOLD:
-        print(f"  [Stage 4b] Skipping CLAHE (LC score={lc_score} > {CLAHE_SKIP_THRESHOLD})")
+        _log(f"  [Stage 4b] Skipping CLAHE (LC score={lc_score} > {CLAHE_SKIP_THRESHOLD})")
     else:
         # Candidate 2: CLAHE-enhanced filter (night / low-contrast scenes)
         cl_line_mask, cl_court_mask, _, cl_thresh_v = agrawal_clahe_line_filter(near_half, hsv=hsv)
         cl_line_px = np.count_nonzero(cl_line_mask)
-        print(f"  [Stage 2+3] CLAHE: {cl_line_px} line pixels, "
-              f"thresh_v={cl_thresh_v}")
+        _log(f"  [Stage 2+3] CLAHE: {cl_line_px} line pixels, "
+             f"thresh_v={cl_thresh_v}")
         c2 = _run_candidate(cl_line_mask, "CLAHE")
         candidates.append(("clahe", c2, cl_court_mask, court_color, "clahe"))
 
@@ -2588,8 +2568,8 @@ def run_agrawal_pipeline(
             valid_candidates, key=lambda x: x[1][7])  # index 7 = score
         best_H, best_near_kps, best_identified, best_h, best_v, best_raw, best_lm, best_score, best_err, best_pre_v = best_cand
 
-        print(f"  [Stage 4b] Winner: {best_name} (score={best_score}, reproj={best_err:.1f}px, "
-              f"mode={best_court_mode}) ({time.time()-t4b:.3f}s)")
+        _log(f"  [Stage 4b] Winner: {best_name} (score={best_score}, reproj={best_err:.1f}px, "
+             f"mode={best_court_mode}) ({time.time()-t4b:.3f}s)")
         horizontal, vertical = best_h, best_v
         pre_filter_verticals = best_pre_v
         raw_lines = best_raw
@@ -2616,12 +2596,11 @@ def run_agrawal_pipeline(
         winning_court_mode = "local_contrast"
 
     # --- Stage 5: Identify near-half lines (already computed in 4b) ---
-    t5 = time.time()
     id_count = sum(1 for v in identified.values() if v is not None)
-    print(f"  [Stage 5] Identified {id_count}/7 court features:")
+    _log(f"  [Stage 5] Identified {id_count}/7 court features:")
     for name, seg in identified.items():
         if seg is not None:
-            print(f"    {name}: ({seg[0]},{seg[1]})->({seg[2]},{seg[3]})")
+            _log(f"    {name}: ({seg[0]},{seg[1]})->({seg[2]},{seg[3]})")
 
     # --- Stage 5b: Fallback service line detection ---
     used_sv_fallback = False
@@ -2630,14 +2609,13 @@ def run_agrawal_pipeline(
         if fb_service is not None:
             identified["near_service"] = fb_service
             used_sv_fallback = True
-            print(f"  [Stage 5b] Fallback service line: "
-                  f"({fb_service[0]:.0f},{fb_service[1]:.0f})->"
-                  f"({fb_service[2]:.0f},{fb_service[3]:.0f})")
+            _log(f"  [Stage 5b] Fallback service line: "
+                 f"({fb_service[0]:.0f},{fb_service[1]:.0f})->"
+                 f"({fb_service[2]:.0f},{fb_service[3]:.0f})")
         else:
-            print(f"  [Stage 5b] Fallback service line: not found")
+            _log("  [Stage 5b] Fallback service line: not found")
 
     # --- Stage 6: Compute near-half keypoints ---
-    t6 = time.time()
     if used_sv_fallback:
         near_kps = compute_near_half_keypoints(identified, y_offset, vertical, nh_h)
         near_kps = validate_near_half_keypoints(near_kps)
@@ -2645,10 +2623,10 @@ def run_agrawal_pipeline(
     else:
         near_kps = list(best_near_kps)
         H_near = best_H
-    print(f"  [Stage 6] Near-half keypoints: {len(near_kps)}")
+    _log(f"  [Stage 6] Near-half keypoints: {len(near_kps)}")
     for kp_idx, (px, py) in near_kps:
         name = KP_NAMES[kp_idx] if kp_idx < len(KP_NAMES) else f"KP{kp_idx}"
-        print(f"    KP{kp_idx} ({name}): ({px:.1f}, {py:.1f})")
+        _log(f"    KP{kp_idx} ({name}): ({px:.1f}, {py:.1f})")
 
     # --- Stage 7: Homography + extend ---
     t7 = time.time()
@@ -2663,13 +2641,13 @@ def run_agrawal_pipeline(
         H_full_raw = H_full
         near_err = reprojection_error(near_kps, H_full) if H_full is not None else float("inf")
         full_err = reprojection_error(all_kps, H_full) if H_full is not None else float("inf")
-        print(f"  [Stage 7] Homography computed: near_err={near_err:.1f}px, "
-              f"full_err={full_err:.1f}px ({time.time()-t7:.2f}s)")
-        print(f"    Total keypoints (near+far): {len(all_kps)}")
+        _log(f"  [Stage 7] Homography computed: near_err={near_err:.1f}px, "
+             f"full_err={full_err:.1f}px ({time.time()-t7:.2f}s)")
+        _log(f"    Total keypoints (near+far): {len(all_kps)}")
 
         # --- Stage 7 safety: revert fallback if it broke the homography ---
         if H_full is None and used_sv_fallback:
-            print(f"  [Stage 7] Fallback service line broke homography — reverting")
+            _log("  [Stage 7] Fallback service line broke homography — reverting")
             identified["near_service"] = None
             used_sv_fallback = False
             # Re-run Stage 6+7 without the fallback service line
@@ -2681,25 +2659,25 @@ def run_agrawal_pipeline(
                 H_full_raw = H_full
                 near_err = reprojection_error(near_kps, H_full) if H_full is not None else float("inf")
                 full_err = reprojection_error(all_kps, H_full) if H_full is not None else float("inf")
-                print(f"  [Stage 7] Reverted: near_err={near_err:.1f}px, "
-                      f"full_err={full_err:.1f}px")
+                _log(f"  [Stage 7] Reverted: near_err={near_err:.1f}px, "
+                     f"full_err={full_err:.1f}px")
 
         # Kalman smoothing
         if kalman is not None and H_full is not None:
             H_full = kalman.update(H_full, near_err, n_kps=len(near_kps),
                                    frame_idx=frame_idx)
             smoothed_err = reprojection_error(near_kps, H_full)
-            print(f"  [Kalman] Smoothed H: reproj {near_err:.2f} → {smoothed_err:.2f}px")
+            _log(f"  [Kalman] Smoothed H: reproj {near_err:.2f} → {smoothed_err:.2f}px")
     else:
-        print(f"  [Stage 7] Homography FAILED — only {len(near_kps)} keypoints "
-              f"(need ≥4)")
+        _log(f"  [Stage 7] Homography FAILED — only {len(near_kps)} keypoints "
+             f"(need ≥4)")
 
         # If no homography, try Kalman prediction
         if H_full is None and kalman is not None:
             H_pred = kalman.predict()
             if H_pred is not None:
                 H_full = H_pred
-                print(f"  [Kalman] Using predicted H (coasting)")
+                _log("  [Kalman] Using predicted H (coasting)")
 
     # Compute raw reprojection error before Kalman for reporting
     raw_near_err = reprojection_error(near_kps, H_full_raw) if H_full_raw is not None else float("inf")
@@ -2707,34 +2685,33 @@ def run_agrawal_pipeline(
 
     # --- Stage 8: Metrics ---
     metrics = compute_metrics(near_kps, all_kps, H_full)
-    print(f"  [Stage 8] Metrics:")
+    _log("  [Stage 8] Metrics:")
     for k, v in metrics.items():
         if isinstance(v, float):
-            print(f"    {k}: {v:.2f}")
+            _log(f"    {k}: {v:.2f}")
         else:
-            print(f"    {k}: {v}")
+            _log(f"    {k}: {v}")
 
     total_time = time.time() - t0
-    print(f"  [Total] Pipeline took {total_time:.2f}s")
+    _log(f"  [Total] Pipeline took {total_time:.2f}s")
 
     # --- Save diagnostic image ---
-    composite = draw_pipeline_stages(
-        original_frame=frame,
-        net_y=net_y,
-        near_half=near_half,
-        court_color_hsv=court_color,
-        court_color_mask=court_color_mask,
-        line_mask=line_mask,
-        horizontal=horizontal,
-        vertical=vertical,
-        identified_lines=identified,
-        near_kps=near_kps,
-        all_kps=all_kps,
-        H_full=H_full,
-        y_offset=y_offset,
-        court_mode=winning_court_mode,
-        pre_filter_verticals=pre_filter_verticals,
-    )
+    composite = None
+    if diagnostic:
+        composite = draw_pipeline_stages(
+            original_frame=frame,
+            near_half=near_half,
+            line_mask=line_mask,
+            horizontal=horizontal,
+            vertical=vertical,
+            identified_lines=identified,
+            near_kps=near_kps,
+            all_kps=all_kps,
+            H_full=H_full,
+            y_offset=y_offset,
+            court_mode=winning_court_mode,
+            pre_filter_verticals=pre_filter_verticals,
+        )
 
     results.update({
         "net_y": net_y,
