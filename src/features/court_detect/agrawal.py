@@ -71,6 +71,7 @@ HOUGH_MIN_LENGTH = 30
 HOUGH_MAX_GAP = 40
 MIN_MERGED_LENGTH = 200
 MAX_MERGE_SEGMENTS = 50
+CENTER_SERVICE_CAP_T_RANGE = (0.38, 0.62)
 MERGE_DEBUG = False
 MERGE_DEBUG_X_RANGE = (400.0, 800.0)
 
@@ -78,6 +79,38 @@ MERGE_DEBUG_X_RANGE = (400.0, 800.0)
 def _log(msg: str) -> None:
     if _VERBOSE:
         print(msg)
+
+
+def _cap_vertical_segments(
+    segments: list[np.ndarray],
+    baseline_extent: tuple[int, int] | None,
+    max_segments: int = MAX_MERGE_SEGMENTS,
+) -> list[np.ndarray]:
+    """Cap raw verticals while preserving center-service-range candidates."""
+    if len(segments) <= max_segments or baseline_extent is None:
+        return segments
+
+    bl_left, bl_right = baseline_extent
+    bl_span = bl_right - bl_left
+    if bl_span <= 1:
+        return segments
+
+    keep_idxs: set[int] = set()
+    other_idxs: list[tuple[float, int]] = []
+    t_lo, t_hi = CENTER_SERVICE_CAP_T_RANGE
+    for idx, seg in enumerate(segments):
+        mid_x = (float(seg[0]) + float(seg[2])) / 2.0
+        t = (mid_x - bl_left) / bl_span
+        if t_lo <= t <= t_hi:
+            keep_idxs.add(idx)
+            continue
+        length = np.hypot(seg[2] - seg[0], seg[3] - seg[1])
+        other_idxs.append((length, idx))
+
+    for _, idx in sorted(other_idxs, reverse=True)[:max_segments]:
+        keep_idxs.add(idx)
+
+    return [seg for idx, seg in enumerate(segments) if idx in keep_idxs]
 # ===================================================================
 # Stage 1: Net detection / near-half crop
 # ===================================================================
@@ -2494,11 +2527,7 @@ def run_agrawal_pipeline(
                 reverse=True,
             )[:MAX_MERGE_SEGMENTS]
         if len(c_v) > MAX_MERGE_SEGMENTS:
-            c_v = sorted(
-                c_v,
-                key=lambda s: np.hypot(s[2] - s[0], s[3] - s[1]),
-                reverse=True,
-            )[:MAX_MERGE_SEGMENTS]
+            c_v = _cap_vertical_segments(c_v, c_bl_ext)
         c_h = filter_short_merged(merge_collinear_segments(c_h))
         c_v_merged = merge_collinear_segments(c_v)
         c_v = filter_short_merged(c_v_merged)
